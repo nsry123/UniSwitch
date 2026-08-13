@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Run Universal Switch",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal",
+            "python": "/Users/sunzeyuan/miniconda3/envs/univ-switch/bin/python",
+            "justMyCode": true
+        }
+    ]
+}
