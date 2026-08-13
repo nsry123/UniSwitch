@@ -25,6 +25,7 @@ tmp/
 checkpoints/
 models/
 outputs/
+tests/
 runs/
 wandb/
 *.ckpt
