@@ -1,37 +1,84 @@
-import numpy as np
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+from typing import Any, Final
+
 import librosa
+import numpy as np
+
+PANN_CHECKPOINT_PATH: Final = Path("models/Cnn14_mAP=0.431.pth")
+PANN_CHECKPOINT_SHA256: Final = "0dc499e40e9761ef5ea061ffc77697697f277f6a960894903df3ada000e34b31"
+
 
 class SignalProcessor:
     """
     Handles transient detection (counting taps) and feature extraction
     (generating a sonic fingerprint) for incoming audio buffers.
     """
-    def __init__(self, model = "Default",sample_rate: int = 16000, hop_length: int = 512):
+
+    def __init__(
+        self,
+        model: str = "legacy",
+        sample_rate: int = 16000,
+        hop_length: int = 512,
+        checkpoint_path: str | Path = PANN_CHECKPOINT_PATH,
+        verify_checkpoint: bool = True,
+    ) -> None:
+        normalized_model = model.lower()
+        if normalized_model == "default":
+            normalized_model = "legacy"
+        if normalized_model not in {"legacy", "pann"}:
+            raise ValueError("model must be either 'legacy' or 'pann'")
+        if sample_rate <= 0 or hop_length <= 0:
+            raise ValueError("sample_rate and hop_length must be positive")
+
         self.sample_rate = sample_rate
-        self.hop_length  = hop_length
-        self.model = model
-        if model == "pann":
+        self.hop_length = hop_length
+        self.model = normalized_model
+        self.checkpoint_path = Path(checkpoint_path)
+        self.verify_checkpoint = verify_checkpoint
+        self.checkpoint_sha256: str | None = None
+        if self.model == "pann":
             self.sample_rate = 32000
 
         # PANN model and its transforms are loaded lazily on first call to
         # extract_features_pann(). This avoids a multi-second PyTorch startup
         # cost when the class is instantiated in contexts that don't use PANN.
-        self._pann_model      = None
-        self._pann_to_mel     = None
-        self._pann_device     = None
+        self._pann_model: Any | None = None
+        self._pann_device: Any | None = None
 
     # ------------------------------------------------------------------ #
     #  Energy gate (used by the listener thread)                          #
     # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _validate_audio(audio_clip: np.ndarray) -> np.ndarray:
+        """Validate and normalize a waveform passed to feature extraction."""
+        waveform = np.asarray(audio_clip)
+        if waveform.ndim != 1:
+            raise ValueError(f"audio_clip must be one-dimensional, got shape {waveform.shape}")
+        if waveform.size == 0:
+            raise ValueError("audio_clip must not be empty")
+        if not np.issubdtype(waveform.dtype, np.number):
+            raise TypeError("audio_clip must contain numeric samples")
+        if not np.isfinite(waveform).all():
+            raise ValueError("audio_clip contains NaN or infinite samples")
+        return waveform.astype(np.float32, copy=False)
 
     def calculate_energy(self, audio_frame: np.ndarray) -> float:
         """
         Calculates the Root Mean Square (RMS) energy of a raw audio frame.
         Used by the listener thread to detect if a sound broke the noise floor.
         """
-        if len(audio_frame) == 0:
+        waveform = np.asarray(audio_frame)
+        if waveform.ndim != 1:
+            raise ValueError("audio_frame must be one-dimensional")
+        if len(waveform) == 0:
             return 0.0
-        return float(np.sqrt(np.mean(audio_frame**2)))
+        if not np.isfinite(waveform).all():
+            raise ValueError("audio_frame contains NaN or infinite samples")
+        return float(np.sqrt(np.mean(waveform.astype(np.float64) ** 2)))
 
     # ------------------------------------------------------------------ #
     #  Knock counting (onset detection — unchanged)                       #
@@ -43,8 +90,9 @@ class SignalProcessor:
         Includes a debounce parameter to prevent room echo or muddy strikes
         from being counted as multiple taps.
         """
-        _, percussive = librosa.effects.hpss(audio_clip)
-        wait_frames   = int((debounce_seconds * self.sample_rate) / self.hop_length)
+        waveform = self._validate_audio(audio_clip)
+        _, percussive = librosa.effects.hpss(waveform)
+        wait_frames = int((debounce_seconds * self.sample_rate) / self.hop_length)
 
         onsets = librosa.onset.onset_detect(
             y=percussive,
@@ -53,7 +101,6 @@ class SignalProcessor:
             wait=wait_frames,
             backtrack=False,
         )
-        print(onsets)
         return len(onsets)
 
     # ------------------------------------------------------------------ #
@@ -61,29 +108,59 @@ class SignalProcessor:
     # ------------------------------------------------------------------ #
 
     def extract_features(self, audio_clip: np.ndarray) -> np.ndarray:
+        waveform = self._validate_audio(audio_clip)
         if self.model == "pann":
-            return self.extract_features_pann(audio_clip=audio_clip)
-        else:
-            return self.extract_features_default(audio_clip=audio_clip)
-
+            return self.extract_features_pann(audio_clip=waveform)
+        return self.extract_features_default(audio_clip=waveform)
 
     def extract_features_default(self, audio_clip: np.ndarray) -> np.ndarray:
         """
         Compresses a 1.5-second audio array into a flat, 1D feature vector
         representing the acoustic profile of the tap.
         """
-        harmonic, percussive = librosa.effects.hpss(audio_clip)
+        waveform = self._validate_audio(audio_clip)
+        _, percussive = librosa.effects.hpss(waveform)
 
-        mfccs    = librosa.feature.mfcc(y=percussive,  sr=self.sample_rate, n_mfcc=13)
-        centroid = librosa.feature.spectral_centroid(y=audio_clip, sr=self.sample_rate)
-        rolloff  = librosa.feature.spectral_rolloff(y=audio_clip,  sr=self.sample_rate)
+        mfccs = librosa.feature.mfcc(y=percussive, sr=self.sample_rate, n_mfcc=13)
+        centroid = librosa.feature.spectral_centroid(y=percussive, sr=self.sample_rate)
+        rolloff = librosa.feature.spectral_rolloff(y=percussive, sr=self.sample_rate)
 
-        feature_vector = np.hstack((
-            np.mean(mfccs, axis=1), np.std(mfccs, axis=1),
-            np.mean(centroid),      np.std(centroid),
-            np.mean(rolloff),       np.std(rolloff),
-        ))
-        return feature_vector
+        feature_vector = np.hstack(
+            (
+                np.mean(mfccs, axis=1),
+                np.std(mfccs, axis=1),
+                np.mean(centroid),
+                np.std(centroid),
+                np.mean(rolloff),
+                np.std(rolloff),
+            )
+        )
+        return feature_vector.astype(np.float64, copy=False)
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as checkpoint_file:
+            for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def validate_pann_checkpoint(self) -> str:
+        """Validate checkpoint presence and, by default, official SHA-256."""
+        resolved_checkpoint = self.checkpoint_path.expanduser().resolve()
+        if not resolved_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"PANN checkpoint not found: {resolved_checkpoint}. "
+                "Run 'python scripts/download_pann.py' or pass --checkpoint."
+            )
+        actual_sha256 = self._sha256_file(resolved_checkpoint)
+        if self.verify_checkpoint and actual_sha256 != PANN_CHECKPOINT_SHA256:
+            raise ValueError(
+                "PANN checkpoint checksum mismatch: "
+                f"expected {PANN_CHECKPOINT_SHA256}, received {actual_sha256}"
+            )
+        self.checkpoint_sha256 = actual_sha256
+        return actual_sha256
 
     # ------------------------------------------------------------------ #
     #  PANN CNN14 feature extractor                                       #
@@ -114,8 +191,16 @@ class SignalProcessor:
         import torch
         import torch.nn as nn
         import torch.nn.functional as F
-        from torchlibrosa.stft       import Spectrogram, LogmelFilterBank
-        from torchlibrosa.augmentation import SpecAugmentation
+        from torchlibrosa.stft import LogmelFilterBank, Spectrogram
+
+        resolved_checkpoint = Path(checkpoint_path).expanduser().resolve()
+        original_checkpoint = self.checkpoint_path
+        self.checkpoint_path = resolved_checkpoint
+        try:
+            self.validate_pann_checkpoint()
+        except Exception:
+            self.checkpoint_path = original_checkpoint
+            raise
 
         # ── Device selection ────────────────────────────────────────────
         if torch.backends.mps.is_available():
@@ -129,12 +214,12 @@ class SignalProcessor:
         # These hyperparameters are fixed by the PANN pretraining recipe.
         # Do not change them — any deviation produces out-of-distribution
         # inputs and silently degrades the embedding.
-        SAMPLE_RATE = 32000   # PANN was pretrained at 32 kHz
+        SAMPLE_RATE = 32000  # PANN was pretrained at 32 kHz
         WINDOW_SIZE = 1024
-        HOP_SIZE    = 320
-        MEL_BINS    = 64
-        FMIN        = 50
-        FMAX        = 14000
+        HOP_SIZE = 320
+        MEL_BINS = 64
+        FMIN = 50
+        FMAX = 14000
 
         spectrogram_extractor = Spectrogram(
             n_fft=WINDOW_SIZE,
@@ -181,16 +266,20 @@ class SignalProcessor:
                 super().__init__()
                 self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False)
                 self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
-                self.bn1   = nn.BatchNorm2d(out_ch)
-                self.bn2   = nn.BatchNorm2d(out_ch)
-                init_layer(self.conv1); init_layer(self.conv2)
-                init_bn(self.bn1);      init_bn(self.bn2)
+                self.bn1 = nn.BatchNorm2d(out_ch)
+                self.bn2 = nn.BatchNorm2d(out_ch)
+                init_layer(self.conv1)
+                init_layer(self.conv2)
+                init_bn(self.bn1)
+                init_bn(self.bn2)
 
             def forward(self, x, pool_size=(2, 2), pool_type="avg"):
                 x = F.relu_(self.bn1(self.conv1(x)))
                 x = F.relu_(self.bn2(self.conv2(x)))
-                if   pool_type == "max":  x = F.max_pool2d(x, pool_size)
-                elif pool_type == "avg":  x = F.avg_pool2d(x, pool_size)
+                if pool_type == "max":
+                    x = F.max_pool2d(x, pool_size)
+                elif pool_type == "avg":
+                    x = F.avg_pool2d(x, pool_size)
                 elif pool_type == "avg+max":
                     x = F.avg_pool2d(x, pool_size) + F.max_pool2d(x, pool_size)
                 return x
@@ -199,27 +288,27 @@ class SignalProcessor:
             def __init__(self):
                 super().__init__()
                 self.spectrogram_extractor = spectrogram_extractor
-                self.logmel_extractor      = logmel_extractor
-                self.bn0         = nn.BatchNorm2d(64)
-                self.conv_block1 = ConvBlock(1,   64)
-                self.conv_block2 = ConvBlock(64,  128)
+                self.logmel_extractor = logmel_extractor
+                self.bn0 = nn.BatchNorm2d(64)
+                self.conv_block1 = ConvBlock(1, 64)
+                self.conv_block2 = ConvBlock(64, 128)
                 self.conv_block3 = ConvBlock(128, 256)
                 self.conv_block4 = ConvBlock(256, 512)
                 self.conv_block5 = ConvBlock(512, 1024)
                 self.conv_block6 = ConvBlock(1024, 2048)
-                self.fc1         = nn.Linear(2048, 2048, bias=True)
+                self.fc1 = nn.Linear(2048, 2048, bias=True)
                 self.fc_audioset = nn.Linear(2048, 527, bias=True)
                 init_bn(self.bn0)
                 init_layer(self.fc1)
                 init_layer(self.fc_audioset)
 
-            def forward(self, waveform: "torch.Tensor"):
-                x = self.spectrogram_extractor(waveform)   # (B, 1, T, F)
-                x = self.logmel_extractor(x)                # (B, 1, T, 64)
+            def forward(self, waveform: torch.Tensor):
+                x = self.spectrogram_extractor(waveform)  # (B, 1, T, F)
+                x = self.logmel_extractor(x)  # (B, 1, T, 64)
 
-                x = x.transpose(1, 3)                       # (B, 64, T, 1)
+                x = x.transpose(1, 3)  # (B, 64, T, 1)
                 x = self.bn0(x)
-                x = x.transpose(1, 3)                       # (B, 1, T, 64)
+                x = x.transpose(1, 3)  # (B, 1, T, 64)
 
                 x = self.conv_block1(x, pool_size=(2, 2), pool_type="avg")
                 x = F.dropout(x, p=0.2, training=self.training)
@@ -239,14 +328,14 @@ class SignalProcessor:
                 x = torch.mean(x, dim=3)
                 x1, _ = torch.max(x, dim=2)
                 x2 = torch.mean(x, dim=2)
-                x  = x1 + x2
-                x  = F.dropout(x, p=0.5, training=self.training)
-                embedding = F.relu_(self.fc1(x))             # (B, 2048)
+                x = x1 + x2
+                x = F.dropout(x, p=0.5, training=self.training)
+                embedding = F.relu_(self.fc1(x))  # (B, 2048)
                 return embedding
 
         # ── Load checkpoint ─────────────────────────────────────────────
         model = Cnn14().to(device)
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(resolved_checkpoint, map_location=device, weights_only=True)
 
         # The official checkpoint stores weights under the key 'model'
         state_dict = checkpoint.get("model", checkpoint)
@@ -257,14 +346,14 @@ class SignalProcessor:
         model.load_state_dict(state_dict, strict=True)
         model.eval()
 
-        self._pann_model  = model
+        self._pann_model = model
         self._pann_device = device
-        print(f"[*] PANN CNN14 loaded on {device} from {checkpoint_path}")
+        print(f"[*] PANN CNN14 loaded on {device} from {resolved_checkpoint}")
 
     def extract_features_pann(
         self,
         audio_clip: np.ndarray,
-        checkpoint_path: str = "models/Cnn14_mAP=0.431.pth",
+        checkpoint_path: str | Path | None = None,
     ) -> np.ndarray:
         """
         Runs the audio clip through a pretrained PANN CNN14 backbone and
@@ -277,9 +366,8 @@ class SignalProcessor:
         Parameters
         ----------
         audio_clip      : np.ndarray
-            Raw float32 waveform at self.sample_rate (16 kHz from the listener).
-            The clip is automatically resampled to 32 kHz to match the PANN
-            pretraining sample rate before the forward pass.
+            Raw mono waveform at self.sample_rate. The PANN application path
+            captures at 32 kHz; other configured rates are resampled.
         checkpoint_path : str
             Path to the CNN14 .pth checkpoint downloaded from Zenodo.
             Only read on the first call; subsequent calls use the cached model.
@@ -296,16 +384,17 @@ class SignalProcessor:
           mode throughout, so dropout is disabled and results are deterministic.
         - On Apple Silicon the MPS backend is selected automatically, reducing
           inference time from ~60 ms (CPU) to ~15 ms per clip.
-        - PANN was pretrained at 32 kHz. The listener captures at 16 kHz.
-          We resample here rather than changing the listener, keeping the rest
-          of the pipeline (onset detection, energy gate) at 16 kHz where
-          librosa's defaults are well-tuned.
+        - PANN was pretrained at 32 kHz. Non-32-kHz callers are resampled.
         """
         import torch
 
         # Lazy load — only on the very first call
+        waveform_array = self._validate_audio(audio_clip)
         if self._pann_model is None:
-            self._load_pann(checkpoint_path)
+            selected_checkpoint = (
+                self.checkpoint_path if checkpoint_path is None else checkpoint_path
+            )
+            self._load_pann(str(selected_checkpoint))
 
         # ── Resample 16 kHz → 32 kHz ────────────────────────────────────
         # PANN's log-mel frontend was computed at 32 kHz during pretraining.
@@ -314,12 +403,12 @@ class SignalProcessor:
         PANN_SR = 32000
         if self.sample_rate != PANN_SR:
             audio_32k = librosa.resample(
-                audio_clip,
+                waveform_array,
                 orig_sr=self.sample_rate,
                 target_sr=PANN_SR,
             )
         else:
-            audio_32k = audio_clip
+            audio_32k = waveform_array
 
         # ── Prepare tensor ───────────────────────────────────────────────
         # CNN14 expects shape (batch, samples). We add the batch dimension,
@@ -328,14 +417,15 @@ class SignalProcessor:
         # to the same device as the model weights.
         waveform = (
             torch.from_numpy(audio_32k.astype(np.float32))
-            .unsqueeze(0)                        # (1, samples)
+            .unsqueeze(0)  # (1, samples)
             .to(self._pann_device)
         )
 
         # ── Forward pass ─────────────────────────────────────────────────
         with torch.no_grad():
-            embedding = self._pann_model(waveform)   # (1, 2048)
+            assert self._pann_model is not None
+            embedding = self._pann_model(waveform)  # (1, 2048)
 
         # ── Return as a plain numpy array ────────────────────────────────
         # .cpu() is a no-op when already on CPU, safe to call unconditionally.
-        return embedding.squeeze(0).cpu().numpy()    # (2048,)
+        return embedding.squeeze(0).cpu().numpy()  # (2048,)

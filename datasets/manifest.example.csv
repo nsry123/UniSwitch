@@ -1,0 +1,4 @@
+path,label,subject,session,device,sample_rate,split
+recordings/subject-01-session-01-desk-01.wav,desk,subject-01,session-01,usb-mic,32000,train
+recordings/subject-02-session-01-desk-01.wav,desk,subject-02,session-01,usb-mic,32000,validation
+recordings/subject-03-session-01-desk-01.wav,desk,subject-03,session-01,usb-mic,32000,test

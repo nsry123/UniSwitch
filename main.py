@@ -1,87 +1,173 @@
-from src.audio.listener import AudioListener
-from src.audio.new_processor import SignalProcessor
-from src.ml.classifier import TapClassifier
-from src.controller import SwitchController
-import pyaudio
+"""Command-line application for interactive knock registration and inference."""
+
+from __future__ import annotations
+
+import argparse
 import threading
-import sys
+from pathlib import Path
 
-def list_input_devices():
-    p = pyaudio.PyAudio()
-    print("--- Available Audio Input Devices ---\n")
-    
-    for i in range(p.get_device_count()):
-        device_info = p.get_device_info_by_index(i)
-        
-        # We only care about devices with input channels (microphones)
-        if device_info.get('maxInputChannels') > 0:
-            name = device_info.get('name')
-            channels = device_info.get('maxInputChannels')
-            sample_rate = int(device_info.get('defaultSampleRate'))
-            
-            print(f"Index [{i}] : {name}")
-            print(f"           - Max Channels: {channels}")
-            print(f"           - Default Rate: {sample_rate} Hz\n")
-            
-    p.terminate()
+import pyaudio
+
+from src.audio.listener import AudioListener
+from src.audio.processor import PANN_CHECKPOINT_PATH, SignalProcessor
+from src.controller import SwitchController
+from src.ml.classifier import TapClassifier
+
+DEFAULT_STATE_PATH = Path("state/registrations.npz")
 
 
-def main(model, device_index):
-    # 1. Initialize the core components
-    processor = SignalProcessor(model = model)
-    classifier = TapClassifier(n_neighbors=3, distance_threshold=20.0)
-    
-    # Assuming your USB mic is device_index 2 (from our previous test)
-    listener = AudioListener(processor, device_index=device_index)
-    controller = SwitchController(classifier)
+def list_input_devices() -> None:
+    """Print available microphone devices and their native sample rates."""
+    audio = pyaudio.PyAudio()
+    try:
+        print("--- Available Audio Input Devices ---\n")
+        for index in range(audio.get_device_count()):
+            device_info = audio.get_device_info_by_index(index)
+            if device_info.get("maxInputChannels", 0) > 0:
+                print(f"Index [{index}] : {device_info.get('name')}")
+                print(f"           - Max Channels: {device_info.get('maxInputChannels')}")
+                print(
+                    f"           - Default Rate: {int(device_info.get('defaultSampleRate'))} Hz\n"
+                )
+    finally:
+        audio.terminate()
 
-    # 2. Spin up the Audio Listener in a background Daemon Thread
+
+def load_or_create_classifier(
+    state_path: Path | None,
+    model_name: str,
+    checkpoint_sha256: str | None,
+    n_neighbors: int,
+    distance_threshold: float,
+) -> TapClassifier:
+    """Load compatible registrations or return a new classifier."""
+    if state_path is None or not state_path.exists():
+        return TapClassifier(
+            n_neighbors=n_neighbors,
+            distance_threshold=distance_threshold,
+        )
+
+    classifier = TapClassifier.load(state_path)
+    saved_model = classifier.metadata.get("feature_extractor")
+    saved_sha256 = classifier.metadata.get("checkpoint_sha256")
+    if saved_model != model_name:
+        raise ValueError(
+            f"state file uses feature extractor {saved_model!r}, not {model_name!r}; "
+            "select the matching --model or a different --state-path"
+        )
+    if model_name == "pann" and saved_sha256 != checkpoint_sha256:
+        raise ValueError(
+            "state file checkpoint hash differs from the selected PANN checkpoint; "
+            "use a compatible state file"
+        )
+    print(f"[*] Loaded {len(classifier.X_data)} registration(s) from {state_path}")
+    return classifier
+
+
+def run_application(arguments: argparse.Namespace) -> int:
+    """Start capture and serve the interactive command loop."""
+    processor = SignalProcessor(
+        model=arguments.model,
+        checkpoint_path=arguments.checkpoint,
+        verify_checkpoint=not arguments.skip_checkpoint_verification,
+    )
+    checkpoint_sha256 = None
+    if arguments.model == "pann":
+        checkpoint_sha256 = processor.validate_pann_checkpoint()
+
+    state_path = None if arguments.no_state else arguments.state_path
+    threshold = arguments.distance_threshold
+    if threshold is None:
+        threshold = 20.0 if arguments.model == "pann" else 2.5
+    classifier = load_or_create_classifier(
+        state_path=state_path,
+        model_name=arguments.model,
+        checkpoint_sha256=checkpoint_sha256,
+        n_neighbors=arguments.neighbors,
+        distance_threshold=threshold,
+    )
+    metadata = {
+        "feature_extractor": arguments.model,
+        "checkpoint_sha256": checkpoint_sha256,
+        "sample_rate": processor.sample_rate,
+    }
+    controller = SwitchController(classifier, state_path=state_path, state_metadata=metadata)
+    listener = AudioListener(
+        processor,
+        device_index=arguments.device_index,
+        threshold=arguments.energy_threshold,
+    )
+
+    def report_worker_error(error: Exception) -> None:
+        print(f"\n[!] Audio processing stopped: {type(error).__name__}: {error}")
+
+    def listen() -> None:
+        try:
+            listener.listen(controller.audio_callback, report_worker_error)
+        except Exception as error:
+            listener.last_error = error
+            report_worker_error(error)
+
     audio_thread = threading.Thread(
-        target=listener .listen, 
-        args=(controller.audio_callback,), 
-        daemon=True
+        target=listen,
+        name="audio-listener",
+        daemon=True,
     )
     audio_thread.start()
 
-    # 3. The Main Thread CLI Loop
     print("\n--- Universal Switch Command Line ---")
     print("Commands:")
-    print("  register <label> : Start teaching a new tap sound")
+    print("  register <label> : Collect examples for a tap surface/location")
+    print("  status           : Show listener and registration state")
     print("  quit             : Exit the application")
     print("-------------------------------------\n")
 
     try:
-        while True:
-            # The main thread blocks here waiting for your keyboard input
-            user_input = input(">> ").strip().lower()
-            
-            if user_input == "quit":
-                print("[*] Shutting down...")
-                sys.exit(0)
-                
-            elif user_input.startswith("register "):
-                # Parse the label from the command (e.g., "register nightstand")
+        while audio_thread.is_alive():
+            user_input = input(">> ").strip()
+            command = user_input.lower()
+            if command == "quit":
+                break
+            if command == "status":
+                print(
+                    f"[*] mode={controller.mode} registrations={len(classifier.X_data)} "
+                    f"listener_alive={audio_thread.is_alive()}"
+                )
+            elif command.startswith("register "):
                 label = user_input.split(" ", 1)[1]
-                controller.set_registration_mode(label=label, taps=10)
-                
+                controller.set_registration_mode(label, taps=arguments.registration_samples)
             else:
-                print("[!] Unknown command. Try 'register <label>' or 'quit'.")
-                
-    except KeyboardInterrupt:
+                print("[!] Unknown command. Use 'register <label>', 'status', or 'quit'.")
+    except (EOFError, KeyboardInterrupt):
         print("\n[*] Shutting down...")
-        sys.exit(0)
+    finally:
+        listener.stop()
+        audio_thread.join(timeout=3.0)
+
+    if listener.last_error is not None:
+        return 1
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--list-devices", action="store_true")
+    parser.add_argument("--device-index", type=int, default=None)
+    parser.add_argument("--model", choices=("pann", "legacy"), default="pann")
+    parser.add_argument("--checkpoint", type=Path, default=PANN_CHECKPOINT_PATH)
+    parser.add_argument("--skip-checkpoint-verification", action="store_true")
+    parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    parser.add_argument("--no-state", action="store_true")
+    parser.add_argument("--neighbors", type=int, default=3)
+    parser.add_argument("--distance-threshold", type=float)
+    parser.add_argument("--energy-threshold", type=float, default=0.015)
+    parser.add_argument("--registration-samples", type=int, default=10)
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    list_input_devices()
-
-    main(model = "pann", device_index=0)
-    # processor = SignalProcessor(model="pann")
-    # listener = AudioListener(processor=processor,device_index=1)
-    # classifier = TapClassifier(distance_threshold=45.0)
-    # controller = SwitchController(classifier=classifier)
-
-    # listener.test_file("tests/file 1.m4a")
-    
-    # controller.set_registration_mode("Wooden table", 10)
-    # listener.listen(controller.audio_callback)
+    cli_arguments = parse_args()
+    if cli_arguments.list_devices:
+        list_input_devices()
+        raise SystemExit(0)
+    raise SystemExit(run_application(cli_arguments))

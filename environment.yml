@@ -1,0 +1,10 @@
+name: univ-switch
+channels:
+  - conda-forge
+dependencies:
+  - ffmpeg=8.0.1
+  - pip
+  - portaudio=19.7.0
+  - python=3.11.11
+  - pip:
+      - -r requirements-dev.txt

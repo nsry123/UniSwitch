@@ -1,13 +1,50 @@
-import pyaudio
-import numpy as np
-from collections import deque
-import librosa
-import threading
+from __future__ import annotations
+
 import queue
+import threading
+from collections import deque
+from collections.abc import Callable
+from typing import Protocol
+
+import librosa
+import numpy as np
+import pyaudio
+
+AudioCallback = Callable[[np.ndarray, int], object]
+ErrorCallback = Callable[[Exception], object]
+
+
+class AudioProcessor(Protocol):
+    """Processing contract consumed by the listener."""
+
+    sample_rate: int
+
+    def calculate_energy(self, audio_frame: np.ndarray) -> float: ...
+
+    def count_taps(self, audio_clip: np.ndarray) -> int: ...
+
+    def extract_features(self, audio_clip: np.ndarray) -> np.ndarray: ...
+
+
+class AudioStream(Protocol):
+    """Subset of the PyAudio stream interface used by capture."""
+
+    def read(self, chunk_size: int, exception_on_overflow: bool = False) -> bytes: ...
+
+    def stop_stream(self) -> None: ...
+
+    def close(self) -> None: ...
 
 
 class AudioListener:
-    def __init__(self, processor, device_index=None, threshold=0.015, pre_roll_sec=0.2, record_sec=1.5):
+    def __init__(
+        self,
+        processor: AudioProcessor,
+        device_index: int | None = None,
+        threshold: float = 0.015,
+        pre_roll_sec: float = 0.2,
+        record_sec: float = 1.5,
+    ) -> None:
         """
         Initializes the microphone stream.
         - threshold:     RMS energy level required to trigger a capture.
@@ -21,30 +58,35 @@ class AudioListener:
         This eliminates the interleaved-read race that caused a single knock to
         appear as multiple events.
         """
-        self.processor    = processor
-        self.threshold    = threshold
-        self.chunk_size   = 1024
+        if threshold < 0 or pre_roll_sec <= 0 or record_sec <= 0:
+            raise ValueError(
+                "threshold must be non-negative and capture durations must be positive"
+            )
+        self.processor = processor
+        self.threshold = threshold
+        self.chunk_size = 1024
         self.device_index = device_index
 
-        self.format   = pyaudio.paFloat32
+        self.format = pyaudio.paFloat32
         self.channels = 1
-        self.rate     = self.processor.sample_rate
+        self.rate = self.processor.sample_rate
 
         self.pre_roll_chunks = int((pre_roll_sec * self.rate) / self.chunk_size)
-        self.record_chunks   = int((record_sec   * self.rate) / self.chunk_size)
+        self.record_chunks = int((record_sec * self.rate) / self.chunk_size)
 
         # Ring buffer — filled continuously by the listener thread only.
         # Provides the pre-trigger context that captures a knock's attack transient.
-        self.buffer = deque(maxlen=self.pre_roll_chunks)
+        self.buffer: deque[np.ndarray] = deque(maxlen=self.pre_roll_chunks)
 
         # Handoff point between the listener and worker threads.
         # Each item is a *complete*, contiguous np.ndarray ready for processing.
         # The listener assembles the entire clip (pre-roll + post-trigger) before
         # enqueueing, so the worker never needs to read from the stream.
-        self._capture_queue = queue.Queue()
+        self._capture_queue: queue.Queue[np.ndarray] = queue.Queue()
 
         # Signals both threads to exit cleanly.
         self._stop_event = threading.Event()
+        self.last_error: Exception | None = None
 
         self.audio = pyaudio.PyAudio()
 
@@ -52,7 +94,15 @@ class AudioListener:
     #  Public interface                                                    #
     # ------------------------------------------------------------------ #
 
-    def listen(self, trigger_callback):
+    def stop(self) -> None:
+        """Request a graceful stop from another thread."""
+        self._stop_event.set()
+
+    def listen(
+        self,
+        trigger_callback: AudioCallback,
+        error_callback: ErrorCallback | None = None,
+    ) -> None:
         """
         Opens the mic and starts two threads:
 
@@ -65,62 +115,69 @@ class AudioListener:
              count_taps / extract_features, and fires the callback.
              All CPU-heavy work lives here so the listener is never stalled.
         """
-        stream = self.audio.open(
-            format=self.format,
-            channels=self.channels,
-            rate=self.rate,
-            input=True,
-            input_device_index=self.device_index,
-            frames_per_buffer=self.chunk_size,
-        )
-
-        worker = threading.Thread(
-            target=self._worker_loop,
-            args=(trigger_callback,),
-            daemon=True,
-        )
-        worker.start()
-
-        print(f"[*] Mic active. Listening for taps (Threshold: {self.threshold})...")
-
+        self._stop_event.clear()
+        self.last_error = None
+        stream = None
+        worker = None
         try:
+            stream = self.audio.open(
+                format=self.format,
+                channels=self.channels,
+                rate=self.rate,
+                input=True,
+                input_device_index=self.device_index,
+                frames_per_buffer=self.chunk_size,
+            )
+            worker = threading.Thread(
+                target=self._worker_loop,
+                args=(trigger_callback, error_callback),
+                daemon=True,
+            )
+            worker.start()
+            print(f"[*] Mic active. Listening for taps (Threshold: {self.threshold})...")
             self._listener_loop(stream)
         except KeyboardInterrupt:
             print("\n[*] Stopping listener...")
         finally:
-            self._stop_event.set()
-            worker.join(timeout=3.0)
-            stream.stop_stream()
-            stream.close()
+            self.stop()
+            if worker is not None:
+                worker.join(timeout=3.0)
+            if stream is not None:
+                stream.stop_stream()
+                stream.close()
             self.audio.terminate()
 
-    def test_file(self, file_path: str):
+    def test_file(self, file_path: str) -> tuple[np.ndarray, int]:
         """
         Loads an audio file, simulates the energy gate by trimming silence,
         and extracts features just like the live microphone listener.
         """
         print(f"[*] Loading test file: {file_path}")
         try:
-            y, sr    = librosa.load(file_path, sr=self.processor.sample_rate, mono=True)
+            y, sr = librosa.load(file_path, sr=self.processor.sample_rate, mono=True)
             y_trimmed, _ = librosa.effects.trim(y, top_db=20)
-            print(f"[*] Audio loaded. Original: {len(y)/sr:.2f}s  Trimmed: {len(y_trimmed)/sr:.2f}s")
+            original_duration = len(y) / sr
+            trimmed_duration = len(y_trimmed) / sr
+            print(
+                f"[*] Audio loaded. Original: {original_duration:.2f}s "
+                f"Trimmed: {trimmed_duration:.2f}s"
+            )
 
             tap_count = self.processor.count_taps(y_trimmed)
-            features  = self.processor.extract_features(y_trimmed)
+            features = self.processor.extract_features(y_trimmed)
 
             print(f"[*] Taps detected: {tap_count}")
             print(f"[*] Feature vector length: {len(features)}")
             return features, tap_count
 
-        except Exception as e:
-            print(f"[!] Error loading file {file_path}: {e}")
-            return None, 0
+        except Exception as error:
+            raise RuntimeError(f"could not process audio file {file_path}: {error}") from error
 
     # ------------------------------------------------------------------ #
     #  Private — listener thread (sole owner of the stream)               #
     # ------------------------------------------------------------------ #
 
-    def _listener_loop(self, stream):
+    def _listener_loop(self, stream: AudioStream) -> None:
         """
         Runs on the main thread and is the *only* place stream.read() is called.
 
@@ -139,13 +196,13 @@ class AudioListener:
         assembled clip is always perfectly contiguous — no interleaving gaps
         that would fool count_taps into seeing phantom knocks.
         """
-        capturing         = False
-        post_trigger      = []   # staging list for post-trigger chunks
-        pre_roll_snapshot = []   # frozen copy of ring buffer at trigger moment
-        remaining_chunks  = 0
+        capturing = False
+        post_trigger: list[np.ndarray] = []  # staging list for post-trigger chunks
+        pre_roll_snapshot: list[np.ndarray] = []  # frozen ring buffer at trigger
+        remaining_chunks = 0
 
         while not self._stop_event.is_set():
-            data        = stream.read(self.chunk_size, exception_on_overflow=False)
+            data = stream.read(self.chunk_size, exception_on_overflow=False)
             audio_frame = np.frombuffer(data, dtype=np.float32)
 
             if not capturing:
@@ -159,9 +216,9 @@ class AudioListener:
                     # included via the append above, so it appears exactly once
                     # at the end of pre_roll_snapshot — no double-count at the seam.
                     pre_roll_snapshot = list(self.buffer)
-                    post_trigger      = []
-                    remaining_chunks  = self.record_chunks
-                    capturing         = True
+                    post_trigger = []
+                    remaining_chunks = self.record_chunks
+                    capturing = True
 
             else:
                 # CAPTURING: accumulate post-trigger chunks.
@@ -177,7 +234,7 @@ class AudioListener:
 
                     # Seed the ring buffer with the tail of the just-captured
                     # window so the next event's pre-roll is meaningful.
-                    tail = post_trigger[-self.pre_roll_chunks:]
+                    tail = post_trigger[-self.pre_roll_chunks :]
                     self.buffer.clear()
                     self.buffer.extend(tail)
 
@@ -187,7 +244,11 @@ class AudioListener:
     #  Private — worker thread                                             #
     # ------------------------------------------------------------------ #
 
-    def _worker_loop(self, trigger_callback):
+    def _worker_loop(
+        self,
+        trigger_callback: AudioCallback,
+        error_callback: ErrorCallback | None = None,
+    ) -> None:
         """
         Runs on a background daemon thread. Dequeues complete audio clips
         (assembled entirely by the listener) and performs all CPU-heavy work:
@@ -203,7 +264,17 @@ class AudioListener:
             except queue.Empty:
                 continue
 
-            tap_count = self.processor.count_taps(full_clip)
-            features  = self.processor.extract_features(full_clip)
-
-            trigger_callback(features, tap_count)
+            try:
+                tap_count = self.processor.count_taps(full_clip)
+                features = self.processor.extract_features(full_clip)
+                trigger_callback(features, tap_count)
+            except Exception as error:
+                self.last_error = error
+                if error_callback is not None:
+                    error_callback(error)
+                else:
+                    print(f"[!] Audio processing worker stopped: {error}")
+                self.stop()
+                return
+            finally:
+                self._capture_queue.task_done()

@@ -3,6 +3,7 @@
 
 # Python
 __pycache__/
+.ipynb_checkpoints/
 *.py[cod]
 .venv/
 venv/
@@ -25,10 +26,16 @@ tmp/
 checkpoints/
 models/
 outputs/
-tests/
 runs/
 wandb/
 *.ckpt
 *.pt
 *.pth
 *.safetensors
+
+# Persisted local registrations and evaluation artifacts
+state/
+
+# Test recordings are opt-in fixtures; tests themselves must stay tracked.
+tests/fixtures/local/
+tests/*.m4a

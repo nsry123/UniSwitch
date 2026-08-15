@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "universal-switch"
+version = "0.1.0"
+description = "User-trained acoustic knock and tap classifier"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "librosa==0.11.0",
+    "numpy==2.4.2",
+    "PyAudio==0.2.14",
+    "scikit-learn==1.8.0",
+    "scipy==1.17.1",
+    "torch==2.11.0",
+    "torchlibrosa==0.1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy==1.19.1",
+    "pytest==9.0.2",
+    "ruff==0.15.4",
+]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+markers = [
+    "integration: tests that require the optional PANN checkpoint",
+]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+ignore_missing_imports = true
+warn_unused_ignores = true
+exclude = ["notebooks/"]
