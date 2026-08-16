@@ -11,7 +11,8 @@ import pyaudio
 from src.audio.listener import AudioListener
 from src.audio.processor import PANN_CHECKPOINT_PATH, SignalProcessor
 from src.controller import SwitchController
-from src.ml.classifier import TapClassifier
+from src.ml.classifier import DistanceMode, TapClassifier
+from src.web.app import MicrophoneMonitor
 
 DEFAULT_STATE_PATH = Path("state/registrations.npz")
 
@@ -39,12 +40,14 @@ def load_or_create_classifier(
     checkpoint_sha256: str | None,
     n_neighbors: int,
     distance_threshold: float,
+    distance_mode: DistanceMode,
 ) -> TapClassifier:
     """Load compatible registrations or return a new classifier."""
     if state_path is None or not state_path.exists():
         return TapClassifier(
             n_neighbors=n_neighbors,
             distance_threshold=distance_threshold,
+            distance_mode=distance_mode,
         )
 
     classifier = TapClassifier.load(state_path)
@@ -60,6 +63,11 @@ def load_or_create_classifier(
             "state file checkpoint hash differs from the selected PANN checkpoint; "
             "use a compatible state file"
         )
+    if classifier.distance_mode != distance_mode:
+        raise ValueError(
+            f"state file uses distance mode {classifier.distance_mode!r}, "
+            f"not {distance_mode!r}; use a compatible state file"
+        )
     print(f"[*] Loaded {len(classifier.X_data)} registration(s) from {state_path}")
     return classifier
 
@@ -73,18 +81,26 @@ def run_application(arguments: argparse.Namespace) -> int:
     )
     checkpoint_sha256 = None
     if arguments.model == "pann":
-        checkpoint_sha256 = processor.validate_pann_checkpoint()
+        checkpoint_sha256 = processor.prepare()
 
     state_path = None if arguments.no_state else arguments.state_path
+    distance_mode: DistanceMode = (
+        "cosine" if arguments.model == "pann" else "standardized_euclidean"
+    )
     threshold = arguments.distance_threshold
     if threshold is None:
-        threshold = 20.0 if arguments.model == "pann" else 2.5
+        threshold = 0.20 if arguments.model == "pann" else 2.5
     classifier = load_or_create_classifier(
         state_path=state_path,
         model_name=arguments.model,
         checkpoint_sha256=checkpoint_sha256,
         n_neighbors=arguments.neighbors,
         distance_threshold=threshold,
+        distance_mode=distance_mode,
+    )
+    print(
+        f"[*] Classifier distance: {classifier.distance_mode} "
+        f"(rejection threshold: {classifier.distance_threshold:g})"
     )
     metadata = {
         "feature_extractor": arguments.model,
@@ -92,10 +108,19 @@ def run_application(arguments: argparse.Namespace) -> int:
         "sample_rate": processor.sample_rate,
     }
     controller = SwitchController(classifier, state_path=state_path, state_metadata=metadata)
+    monitor = None
+    if not arguments.no_monitor:
+        monitor = MicrophoneMonitor(
+            threshold=arguments.energy_threshold,
+            sample_rate=processor.sample_rate,
+            port=arguments.monitor_port,
+        )
+        monitor.start(open_browser=True)
     listener = AudioListener(
         processor,
         device_index=arguments.device_index,
         threshold=arguments.energy_threshold,
+        frame_callback=None if monitor is None else monitor.publish,
     )
 
     def report_worker_error(error: Exception) -> None:
@@ -143,6 +168,8 @@ def run_application(arguments: argparse.Namespace) -> int:
     finally:
         listener.stop()
         audio_thread.join(timeout=3.0)
+        if monitor is not None:
+            monitor.stop()
 
     if listener.last_error is not None:
         return 1
@@ -162,6 +189,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--distance-threshold", type=float)
     parser.add_argument("--energy-threshold", type=float, default=0.015)
     parser.add_argument("--registration-samples", type=int, default=10)
+    parser.add_argument("--monitor-port", type=int, default=8765)
+    parser.add_argument("--no-monitor", action="store_true")
     return parser.parse_args()
 
 

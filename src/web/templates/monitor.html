@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Universal Switch · Microphone Monitor</title>
+    <link rel="stylesheet" href="/monitor.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">Universal Switch</p>
+          <h1>Microphone monitor</h1>
+          <p class="subtitle">Live input diagnostics for reliable knock detection.</p>
+        </div>
+        <div class="status" id="connection-status"><span></span> Waiting for audio</div>
+      </header>
+
+      <section class="metrics" aria-label="Live microphone metrics">
+        <article>
+          <p>RMS energy</p>
+          <strong id="energy-value">0.0000</strong>
+        </article>
+        <article>
+          <p>Trigger threshold</p>
+          <strong id="threshold-value">0.0150</strong>
+        </article>
+        <article>
+          <p>Peak amplitude</p>
+          <strong id="peak-value">0.0000</strong>
+        </article>
+        <article>
+          <p>Capture state</p>
+          <strong id="capture-state">Idle</strong>
+        </article>
+      </section>
+
+      <section class="panel energy-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Detection signal</p>
+            <h2>Energy over time</h2>
+          </div>
+          <div class="legend"><span></span> Threshold <b id="threshold-legend">0.0150</b></div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="energy-chart" aria-label="Live RMS energy with trigger threshold"></canvas>
+        </div>
+      </section>
+
+      <section class="panel waveform-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">Latest buffer</p>
+            <h2>Microphone waveform</h2>
+          </div>
+          <p class="sample-rate"><span id="sample-rate">—</span> Hz</p>
+        </div>
+        <div class="wave-wrap">
+          <canvas id="waveform-chart" aria-label="Latest microphone waveform"></canvas>
+        </div>
+      </section>
+
+      <p class="hint">A knock starts capture when the green energy trace crosses the amber threshold.</p>
+    </main>
+    <script src="/monitor.js"></script>
+  </body>
+</html>

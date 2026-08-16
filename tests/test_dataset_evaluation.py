@@ -80,3 +80,28 @@ def test_calibration_and_evaluation_separate_unknown_rejection() -> None:
     assert calibration.unknown_rejection_rate == 1.0
     assert report.known_end_to_end_accuracy == 1.0
     assert report.unknown_rejection_rate == 1.0
+
+
+def test_cosine_calibration_matches_runtime_distance_mode() -> None:
+    train_x = np.array(
+        [[1.0, 0.0], [1.0, 0.01], [0.0, 1.0], [0.01, 1.0]]
+    )
+    train_y = np.array(["desk", "desk", "wall", "wall"])
+    validation_x = np.array([[10.0, 0.0], [0.0, 10.0], [-1.0, 0.0]])
+    validation_y = np.array(["desk", "wall", "unknown-surface"])
+
+    classifier, calibration = calibrate_classifier(
+        train_x,
+        train_y,
+        validation_x,
+        validation_y,
+        neighbor_candidates=(1,),
+        distance_mode="cosine",
+    )
+    report = evaluate_classifier(classifier, validation_x, validation_y)
+
+    assert classifier.distance_mode == "cosine"
+    assert calibration.known_end_to_end_accuracy == 1.0
+    assert calibration.unknown_rejection_rate == 1.0
+    assert report.known_end_to_end_accuracy == 1.0
+    assert report.unknown_rejection_rate == 1.0

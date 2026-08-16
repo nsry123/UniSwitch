@@ -12,6 +12,7 @@ import pyaudio
 
 AudioCallback = Callable[[np.ndarray, int], object]
 ErrorCallback = Callable[[Exception], object]
+FrameCallback = Callable[[np.ndarray, float, bool], object]
 
 
 class AudioProcessor(Protocol):
@@ -44,6 +45,7 @@ class AudioListener:
         threshold: float = 0.015,
         pre_roll_sec: float = 0.2,
         record_sec: float = 1.5,
+        frame_callback: FrameCallback | None = None,
     ) -> None:
         """
         Initializes the microphone stream.
@@ -66,6 +68,7 @@ class AudioListener:
         self.threshold = threshold
         self.chunk_size = 1024
         self.device_index = device_index
+        self.frame_callback = frame_callback
 
         self.format = pyaudio.paFloat32
         self.channels = 1
@@ -204,12 +207,11 @@ class AudioListener:
         while not self._stop_event.is_set():
             data = stream.read(self.chunk_size, exception_on_overflow=False)
             audio_frame = np.frombuffer(data, dtype=np.float32)
+            energy = self.processor.calculate_energy(audio_frame)
 
             if not capturing:
                 # IDLE: keep the ring buffer fresh.
                 self.buffer.append(audio_frame)
-
-                energy = self.processor.calculate_energy(audio_frame)
 
                 if energy > self.threshold:
                     # Freeze the ring buffer. The trigger chunk is already
@@ -239,6 +241,13 @@ class AudioListener:
                     self.buffer.extend(tail)
 
                     capturing = False
+
+            if self.frame_callback is not None:
+                try:
+                    self.frame_callback(audio_frame, energy, capturing)
+                except Exception as error:
+                    print(f"[!] Microphone monitor stopped receiving audio: {error}")
+                    self.frame_callback = None
 
     # ------------------------------------------------------------------ #
     #  Private — worker thread                                             #

@@ -77,6 +77,7 @@ def main(arguments: argparse.Namespace) -> int:
         validation_features,
         validation_labels,
         arguments.neighbors,
+        distance_mode="cosine" if arguments.model == "pann" else "standardized_euclidean",
     )
     report = evaluate_classifier(classifier, test_features, test_labels)
     result = {"calibration": calibration.__dict__, "test": report.to_dict()}

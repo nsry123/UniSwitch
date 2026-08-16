@@ -48,6 +48,14 @@ class SignalProcessor:
         self._pann_model: Any | None = None
         self._pann_device: Any | None = None
 
+    def prepare(self) -> str | None:
+        """Load resources required for feature extraction before capture starts."""
+        if self.model != "pann":
+            return None
+        if self._pann_model is None:
+            self._load_pann(str(self.checkpoint_path))
+        return self.checkpoint_sha256
+
     # ------------------------------------------------------------------ #
     #  Energy gate (used by the listener thread)                          #
     # ------------------------------------------------------------------ #
@@ -378,8 +386,9 @@ class SignalProcessor:
 
         Notes
         -----
-        - The model is loaded lazily on the first call and cached on the
-          instance, so the ~2 s PyTorch startup cost is paid once only.
+        - The model is loaded lazily on the first call unless prepare() was
+          called during application startup. It is cached on the instance, so
+          the ~2 s PyTorch startup cost is paid once only.
         - Inference runs under torch.no_grad() and the model stays in eval()
           mode throughout, so dropout is disabled and results are deterministic.
         - On Apple Silicon the MPS backend is selected automatically, reducing

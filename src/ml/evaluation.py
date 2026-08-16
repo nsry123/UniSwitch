@@ -10,7 +10,12 @@ from sklearn.metrics import f1_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import StandardScaler
 
-from src.ml.classifier import TapClassifier
+from src.ml.classifier import (
+    DistanceMode,
+    TapClassifier,
+    normalize_feature_matrix,
+    validate_distance_mode,
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,7 @@ def calibrate_classifier(
     validation_features: np.ndarray,
     validation_labels: np.ndarray,
     neighbor_candidates: Iterable[int] = (1, 3, 5, 7),
+    distance_mode: DistanceMode = "standardized_euclidean",
 ) -> tuple[TapClassifier, CalibrationResult]:
     """Select K and rejection distance using only the validation split."""
     x_train = _as_feature_matrix(train_features, "train_features")
@@ -73,15 +79,26 @@ def calibrate_classifier(
     if not known_mask.any():
         raise ValueError("validation split contains no labels represented in training")
 
-    scaler = StandardScaler().fit(x_train)
-    scaled_train = scaler.transform(x_train)
-    scaled_validation = scaler.transform(x_validation)
+    selected_mode = validate_distance_mode(distance_mode)
+    if selected_mode == "cosine":
+        transformed_train = normalize_feature_matrix(x_train, "train_features")
+        transformed_validation = normalize_feature_matrix(
+            x_validation, "validation_features"
+        )
+    else:
+        scaler = StandardScaler().fit(x_train)
+        transformed_train = scaler.transform(x_train)
+        transformed_validation = scaler.transform(x_validation)
     best: CalibrationResult | None = None
 
     for n_neighbors in candidates:
-        model = KNeighborsClassifier(n_neighbors=n_neighbors).fit(scaled_train, y_train)
-        predicted = model.predict(scaled_validation)
-        distances, _ = model.kneighbors(scaled_validation, n_neighbors=1)
+        model = KNeighborsClassifier(
+            n_neighbors=n_neighbors,
+            metric="cosine" if selected_mode == "cosine" else "minkowski",
+            algorithm="brute" if selected_mode == "cosine" else "auto",
+        ).fit(transformed_train, y_train)
+        predicted = model.predict(transformed_validation)
+        distances, _ = model.kneighbors(transformed_validation, n_neighbors=1)
         nearest = distances[:, 0]
         thresholds = np.unique(
             np.concatenate(([0.0], nearest, [np.nextafter(nearest.max(), np.inf)]))
@@ -118,7 +135,11 @@ def calibrate_classifier(
                 best = result
 
     assert best is not None
-    classifier = TapClassifier(best.n_neighbors, best.distance_threshold)
+    classifier = TapClassifier(
+        best.n_neighbors,
+        best.distance_threshold,
+        distance_mode=selected_mode,
+    )
     for vector, label in zip(x_train, y_train, strict=True):
         classifier.register_tap(vector, str(label))
     return classifier, best

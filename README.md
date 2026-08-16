@@ -6,8 +6,8 @@ knock onsets within each captured window. A pretrained PANN CNN14 network create
 audio embeddings; an in-memory or persisted scikit-learn KNN model learns the
 user's labels. No cloud service is involved.
 
-The switch/action bridge and web UI are not implemented. A successful
-classification currently prints an action message to the terminal.
+The switch/action bridge is not implemented. A successful classification
+currently prints an action message to the terminal.
 
 ## Setup
 
@@ -56,10 +56,18 @@ Start the listener, selecting the correct input device index:
 conda run -n univ-switch python main.py --device-index 0
 ```
 
+The application opens a localhost microphone monitor in your browser. Its live
+charts show the latest waveform, RMS energy, and the labeled trigger threshold,
+making it easier to tune `--energy-threshold`. Use `--monitor-port 9000` to
+select another local port or `--no-monitor` to run without the dashboard.
+
 At the prompt, enter `register desk`. Each threshold-triggered capture window is
 one registration example, even if onset detection finds multiple knocks inside
 that window. Registrations are saved to `state/registrations.npz` by default and
 loaded on the next startup. Enter `quit` or press Ctrl-C for a graceful shutdown.
+PANN embeddings use L2 normalization and cosine distance with a provisional
+default rejection threshold of `0.20`; the active metric and threshold are
+printed at startup.
 
 For the faster 30-value legacy feature extractor:
 
@@ -108,3 +116,7 @@ download models, use a microphone, or call external services.
 - **Numba cache is unwritable:** set `NUMBA_CACHE_DIR` to a writable cache path.
 - **Worker stopped:** the CLI prints the processing exception and stops capture;
   fix the reported model/audio error before restarting.
+- **Monitor port is already in use:** pass another value such as
+  `--monitor-port 9000`.
+- **Schema-v1 PANN registration error:** re-register using a new `--state-path`
+  or move/remove the old state file. Legacy registration files remain compatible.

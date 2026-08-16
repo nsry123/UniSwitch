@@ -1,5 +1,6 @@
 import queue
 import threading
+from collections import deque
 
 import numpy as np
 
@@ -8,6 +9,9 @@ from src.audio.listener import AudioListener
 
 class StubProcessor:
     sample_rate = 16000
+
+    def calculate_energy(self, waveform: np.ndarray) -> float:
+        return float(np.sqrt(np.mean(waveform**2)))
 
     def count_taps(self, waveform: np.ndarray) -> int:
         return int(np.count_nonzero(waveform))
@@ -64,3 +68,45 @@ def test_worker_surfaces_processing_failure() -> None:
     assert isinstance(listener.last_error, RuntimeError)
     assert errors and str(errors[0]) == "feature failure"
     assert listener._stop_event.is_set()
+
+
+def test_listener_reports_live_frames_and_capture_state() -> None:
+    listener = AudioListener.__new__(AudioListener)
+    listener.processor = StubProcessor()
+    listener.chunk_size = 3
+    listener.threshold = 0.1
+    listener.pre_roll_chunks = 1
+    listener.record_chunks = 1
+    listener.buffer = deque(maxlen=1)
+    listener._capture_queue = queue.Queue()
+    listener._stop_event = threading.Event()
+    updates: list[tuple[float, bool]] = []
+
+    def frame_callback(_frame: np.ndarray, energy: float, capturing: bool) -> None:
+        updates.append((energy, capturing))
+        if len(updates) == 2:
+            listener.stop()
+
+    listener.frame_callback = frame_callback
+
+    class StubStream:
+        frames = iter(
+            (
+                np.array([0.0, 0.5, 0.0], dtype=np.float32).tobytes(),
+                np.zeros(3, dtype=np.float32).tobytes(),
+            )
+        )
+
+        def read(self, _chunk_size: int, exception_on_overflow: bool = False) -> bytes:
+            return next(self.frames)
+
+        def stop_stream(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    listener._listener_loop(StubStream())
+
+    assert updates[0][0] > listener.threshold
+    assert updates == [(updates[0][0], True), (0.0, False)]

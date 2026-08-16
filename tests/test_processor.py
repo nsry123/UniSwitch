@@ -35,3 +35,25 @@ def test_processor_rejects_invalid_waveforms(waveform: np.ndarray) -> None:
 def test_processor_rejects_unknown_model() -> None:
     with pytest.raises(ValueError, match="model must be"):
         SignalProcessor(model="unknown")
+
+
+def test_prepare_is_no_op_for_legacy_processor() -> None:
+    processor = SignalProcessor(model="legacy")
+
+    assert processor.prepare() is None
+
+
+def test_prepare_eagerly_loads_and_caches_pann(monkeypatch) -> None:
+    processor = SignalProcessor(model="pann")
+    load_calls: list[str] = []
+
+    def load_pann(checkpoint_path: str) -> None:
+        load_calls.append(checkpoint_path)
+        processor._pann_model = object()
+        processor.checkpoint_sha256 = "test-sha256"
+
+    monkeypatch.setattr(processor, "_load_pann", load_pann)
+
+    assert processor.prepare() == "test-sha256"
+    assert processor.prepare() == "test-sha256"
+    assert load_calls == [str(processor.checkpoint_path)]
