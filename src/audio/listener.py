@@ -4,6 +4,7 @@ import queue
 import threading
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 import librosa
@@ -15,6 +16,14 @@ ErrorCallback = Callable[[Exception], object]
 FrameCallback = Callable[[np.ndarray, float, bool], object]
 
 
+@dataclass(frozen=True)
+class CapturedAudio:
+    """A complete capture plus the first sample belonging to its trigger chunk."""
+
+    waveform: np.ndarray
+    trigger_sample: int
+
+
 class AudioProcessor(Protocol):
     """Processing contract consumed by the listener."""
 
@@ -22,7 +31,9 @@ class AudioProcessor(Protocol):
 
     def calculate_energy(self, audio_frame: np.ndarray) -> float: ...
 
-    def count_taps(self, audio_clip: np.ndarray) -> int: ...
+    def count_taps(
+        self, audio_clip: np.ndarray, energy_threshold: float = 0.015
+    ) -> int: ...
 
     def extract_features(self, audio_clip: np.ndarray) -> np.ndarray: ...
 
@@ -82,10 +93,10 @@ class AudioListener:
         self.buffer: deque[np.ndarray] = deque(maxlen=self.pre_roll_chunks)
 
         # Handoff point between the listener and worker threads.
-        # Each item is a *complete*, contiguous np.ndarray ready for processing.
+        # Each item contains a complete, contiguous waveform and trigger offset.
         # The listener assembles the entire clip (pre-roll + post-trigger) before
         # enqueueing, so the worker never needs to read from the stream.
-        self._capture_queue: queue.Queue[np.ndarray] = queue.Queue()
+        self._capture_queue: queue.Queue[CapturedAudio] = queue.Queue()
 
         # Signals both threads to exit cleanly.
         self._stop_event = threading.Event()
@@ -166,7 +177,7 @@ class AudioListener:
                 f"Trimmed: {trimmed_duration:.2f}s"
             )
 
-            tap_count = self.processor.count_taps(y_trimmed)
+            tap_count = self.processor.count_taps(y_trimmed, self.threshold)
             features = self.processor.extract_features(y_trimmed)
 
             print(f"[*] Taps detected: {tap_count}")
@@ -232,7 +243,10 @@ class AudioListener:
                 if remaining_chunks <= 0:
                     # Assemble and ship the complete, contiguous clip.
                     full_clip = np.concatenate(pre_roll_snapshot + post_trigger)
-                    self._capture_queue.put(full_clip)
+                    trigger_sample = sum(
+                        frame.size for frame in pre_roll_snapshot[:-1]
+                    )
+                    self._capture_queue.put(CapturedAudio(full_clip, trigger_sample))
 
                     # Seed the ring buffer with the tail of the just-captured
                     # window so the next event's pre-roll is meaningful.
@@ -261,21 +275,23 @@ class AudioListener:
         """
         Runs on a background daemon thread. Dequeues complete audio clips
         (assembled entirely by the listener) and performs all CPU-heavy work:
-        onset detection, feature extraction, and the user callback.
+        threshold-based knock counting, feature extraction, and the user callback.
 
         The worker never calls stream.read(). Its only input is the queue of
-        finished np.ndarrays, making it trivially thread-safe with respect to
-        audio capture.
+        finished captures, making it trivially thread-safe with respect to
+        audio capture. Knock counting starts at the trigger chunk, while feature
+        extraction retains the full pre-roll waveform.
         """
         while not self._stop_event.is_set():
             try:
-                full_clip = self._capture_queue.get(timeout=0.1)
+                capture = self._capture_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
             try:
-                tap_count = self.processor.count_taps(full_clip)
-                features = self.processor.extract_features(full_clip)
+                count_waveform = capture.waveform[capture.trigger_sample :]
+                tap_count = self.processor.count_taps(count_waveform, self.threshold)
+                features = self.processor.extract_features(capture.waveform)
                 trigger_callback(features, tap_count)
             except Exception as error:
                 self.last_error = error

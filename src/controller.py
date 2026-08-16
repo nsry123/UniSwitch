@@ -44,7 +44,7 @@ class SwitchController:
         """Begin collecting capture-window examples for ``label``.
 
         ``taps`` is retained for CLI compatibility, but counts callback windows,
-        not the number of onsets detected inside each window.
+        not the number of knocks detected inside each window.
         """
         normalized_label = label.strip()
         if not normalized_label:
@@ -78,7 +78,7 @@ class SwitchController:
                 self.samples_collected += 1
                 print(
                     f"[*] Captured example {self.samples_collected}/{self.samples_needed} "
-                    f"for '{label}' ({tap_count} onset(s))"
+                    f"for '{label}' ({tap_count} knock(s))"
                 )
                 if self.state_path is not None:
                     self.classifier.save(self.state_path, self.state_metadata)

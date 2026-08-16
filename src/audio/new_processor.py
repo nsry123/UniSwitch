@@ -9,6 +9,12 @@ import numpy as np
 
 PANN_CHECKPOINT_PATH: Final = Path("models/Cnn14_mAP=0.431.pth")
 PANN_CHECKPOINT_SHA256: Final = "0dc499e40e9761ef5ea061ffc77697697f277f6a960894903df3ada000e34b31"
+DEFAULT_ENERGY_THRESHOLD: Final = 0.015
+KNOCK_RMS_FRAME_SECONDS: Final = 0.020
+KNOCK_RMS_HOP_SECONDS: Final = 0.010
+KNOCK_RELEASE_RATIO: Final = 0.7
+KNOCK_RELEASE_SECONDS: Final = 0.060
+MIN_KNOCK_INTERVAL_SECONDS: Final = 0.120
 
 
 class SignalProcessor:
@@ -89,27 +95,76 @@ class SignalProcessor:
         return float(np.sqrt(np.mean(waveform.astype(np.float64) ** 2)))
 
     # ------------------------------------------------------------------ #
-    #  Knock counting (onset detection — unchanged)                       #
+    #  Knock counting                                                      #
     # ------------------------------------------------------------------ #
 
-    def count_taps(self, audio_clip: np.ndarray, debounce_seconds: float = 0.05) -> int:
-        """
-        Detects sudden spikes in acoustic energy to count discrete impacts.
-        Includes a debounce parameter to prevent room echo or muddy strikes
-        from being counted as multiple taps.
+    def count_taps(
+        self,
+        audio_clip: np.ndarray,
+        energy_threshold: float = DEFAULT_ENERGY_THRESHOLD,
+    ) -> int:
+        """Count threshold-crossing impacts in a raw mono waveform.
+
+        The high threshold is shared with live capture. After an impact, the
+        detector requires both a quiet release period below 70% of the high
+        threshold and a minimum onset interval before it can count again.
         """
         waveform = self._validate_audio(audio_clip)
-        _, percussive = librosa.effects.hpss(waveform)
-        wait_frames = int((debounce_seconds * self.sample_rate) / self.hop_length)
+        if not np.isfinite(energy_threshold) or energy_threshold < 0:
+            raise ValueError("energy_threshold must be finite and non-negative")
 
-        onsets = librosa.onset.onset_detect(
-            y=percussive,
-            sr=self.sample_rate,
-            hop_length=self.hop_length,
-            wait=wait_frames,
-            backtrack=False,
+        frame_length = max(1, round(KNOCK_RMS_FRAME_SECONDS * self.sample_rate))
+        hop_length = max(1, round(KNOCK_RMS_HOP_SECONDS * self.sample_rate))
+        release_frames = max(1, round(KNOCK_RELEASE_SECONDS / KNOCK_RMS_HOP_SECONDS))
+        minimum_interval_frames = max(
+            1, round(MIN_KNOCK_INTERVAL_SECONDS / KNOCK_RMS_HOP_SECONDS)
         )
-        return len(onsets)
+        energy = self._rms_envelope(waveform, frame_length, hop_length)
+
+        release_threshold = KNOCK_RELEASE_RATIO * energy_threshold
+        armed = True
+        quiet_frames = 0
+        last_knock_frame: int | None = None
+        knock_count = 0
+
+        for frame_index, frame_energy in enumerate(energy):
+            if armed:
+                if frame_energy > energy_threshold:
+                    knock_count += 1
+                    last_knock_frame = frame_index
+                    armed = False
+                    quiet_frames = 0
+                continue
+
+            if frame_energy <= release_threshold:
+                quiet_frames += 1
+            else:
+                quiet_frames = 0
+
+            interval_elapsed = (
+                last_knock_frame is not None
+                and frame_index - last_knock_frame >= minimum_interval_frames
+            )
+            if quiet_frames >= release_frames and interval_elapsed:
+                armed = True
+
+        return knock_count
+
+    @staticmethod
+    def _rms_envelope(
+        waveform: np.ndarray, frame_length: int, hop_length: int
+    ) -> np.ndarray:
+        """Return non-centered RMS frames without normalizing their amplitude."""
+        if waveform.size < frame_length:
+            return np.array(
+                [np.sqrt(np.mean(waveform.astype(np.float64) ** 2))]
+            )
+
+        squared = waveform.astype(np.float64) ** 2
+        cumulative_energy = np.concatenate(([0.0], np.cumsum(squared)))
+        starts = np.arange(0, waveform.size - frame_length + 1, hop_length)
+        frame_energy = cumulative_energy[starts + frame_length] - cumulative_energy[starts]
+        return np.sqrt(frame_energy / frame_length)
 
     # ------------------------------------------------------------------ #
     #  Legacy MFCC feature extractor (kept for backwards compatibility)   #

@@ -4,16 +4,20 @@ from collections import deque
 
 import numpy as np
 
-from src.audio.listener import AudioListener
+from src.audio.listener import AudioListener, CapturedAudio
 
 
 class StubProcessor:
     sample_rate = 16000
 
+    def __init__(self) -> None:
+        self.count_thresholds: list[float] = []
+
     def calculate_energy(self, waveform: np.ndarray) -> float:
         return float(np.sqrt(np.mean(waveform**2)))
 
-    def count_taps(self, waveform: np.ndarray) -> int:
+    def count_taps(self, waveform: np.ndarray, energy_threshold: float = 0.015) -> int:
+        self.count_thresholds.append(energy_threshold)
         return int(np.count_nonzero(waveform))
 
     def extract_features(self, waveform: np.ndarray) -> np.ndarray:
@@ -31,6 +35,7 @@ def worker_only_listener(processor: StubProcessor) -> AudioListener:
     listener._capture_queue = queue.Queue()
     listener._stop_event = threading.Event()
     listener.last_error = None
+    listener.threshold = 0.123
     return listener
 
 
@@ -45,13 +50,18 @@ def test_worker_delivers_processed_capture_without_microphone() -> None:
 
     worker = threading.Thread(target=listener._worker_loop, args=(callback,))
     worker.start()
-    listener._capture_queue.put(np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    capture = CapturedAudio(
+        np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+        trigger_sample=3,
+    )
+    listener._capture_queue.put(capture)
     assert callback_event.wait(timeout=2.0)
     listener.stop()
     worker.join(timeout=2.0)
 
     assert received[0][1] == 1
     np.testing.assert_allclose(received[0][0], [1 / 3, 1.0])
+    assert listener.processor.count_thresholds == [0.123]
 
 
 def test_worker_surfaces_processing_failure() -> None:
@@ -62,7 +72,7 @@ def test_worker_surfaces_processing_failure() -> None:
         args=(lambda _features, _count: None, errors.append),
     )
     worker.start()
-    listener._capture_queue.put(np.ones(3, dtype=np.float32))
+    listener._capture_queue.put(CapturedAudio(np.ones(3, dtype=np.float32), 0))
     worker.join(timeout=2.0)
 
     assert isinstance(listener.last_error, RuntimeError)
@@ -110,3 +120,5 @@ def test_listener_reports_live_frames_and_capture_state() -> None:
 
     assert updates[0][0] > listener.threshold
     assert updates == [(updates[0][0], True), (0.0, False)]
+    capture = listener._capture_queue.get_nowait()
+    assert capture.trigger_sample == 0

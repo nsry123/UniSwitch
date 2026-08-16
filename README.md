@@ -2,9 +2,9 @@
 
 Universal Switch is a local prototype that learns user-defined labels for the
 surface or location of acoustic knocks, such as `desk` or `wall`. It also counts
-knock onsets within each captured window. A pretrained PANN CNN14 network creates
-audio embeddings; an in-memory or persisted scikit-learn KNN model learns the
-user's labels. No cloud service is involved.
+threshold-qualified knocks within each captured window. A pretrained PANN CNN14
+network creates audio embeddings; an in-memory or persisted scikit-learn KNN
+model learns the user's labels. No cloud service is involved.
 
 The switch/action bridge is not implemented. A successful classification
 currently prints an action message to the terminal.
@@ -59,10 +59,13 @@ conda run -n univ-switch python main.py --device-index 0
 The application opens a localhost microphone monitor in your browser. Its live
 charts show the latest waveform, RMS energy, and the labeled trigger threshold,
 making it easier to tune `--energy-threshold`. Use `--monitor-port 9000` to
-select another local port or `--no-monitor` to run without the dashboard.
+select another local port or `--no-monitor` to run without the dashboard. The
+same energy threshold is used to count knocks inside each capture. A counted
+knock must fall below 70% of the threshold before another knock can register,
+which prevents table ringing and threshold chatter from inflating the count.
 
 At the prompt, enter `register desk`. Each threshold-triggered capture window is
-one registration example, even if onset detection finds multiple knocks inside
+one registration example, even if energy detection finds multiple knocks inside
 that window. Registrations are saved to `state/registrations.npz` by default and
 loaded on the next startup. Enter `quit` or press Ctrl-C for a graceful shutdown.
 PANN embeddings use L2 normalization and cosine distance with a provisional

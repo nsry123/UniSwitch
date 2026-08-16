@@ -3,7 +3,7 @@ import threading
 
 import numpy as np
 
-from src.audio.listener import AudioListener
+from src.audio.listener import AudioListener, CapturedAudio
 from src.audio.processor import SignalProcessor
 from src.controller import SwitchController
 from src.ml.classifier import TapClassifier
@@ -26,6 +26,7 @@ def test_synthetic_audio_reaches_registration_and_inference(tmp_path) -> None:
     listener._capture_queue = queue.Queue()
     listener._stop_event = threading.Event()
     listener.last_error = None
+    listener.threshold = 0.015
     callback_results: list[str | None] = []
 
     def callback(features: np.ndarray, tap_count: int) -> None:
@@ -35,9 +36,9 @@ def test_synthetic_audio_reaches_registration_and_inference(tmp_path) -> None:
     worker.start()
     controller.set_registration_mode("desk", taps=3)
     for _ in range(3):
-        listener._capture_queue.put(waveform.copy())
+        listener._capture_queue.put(CapturedAudio(waveform.copy(), 0))
     listener._capture_queue.join()
-    listener._capture_queue.put(waveform.copy())
+    listener._capture_queue.put(CapturedAudio(waveform.copy(), 0))
     listener._capture_queue.join()
     listener.stop()
     worker.join(timeout=2.0)
