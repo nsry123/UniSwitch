@@ -11,7 +11,7 @@ import pyaudio
 from src.audio.listener import AudioListener
 from src.audio.processor import PANN_CHECKPOINT_PATH, SignalProcessor
 from src.controller import SwitchController
-from src.ml.classifier import DistanceMode, TapClassifier
+from src.ml.classifier import DistanceMode, TapClassifier, ThresholdMode
 from src.web.app import MicrophoneMonitor
 
 DEFAULT_STATE_PATH = Path("state/registrations.npz")
@@ -41,6 +41,7 @@ def load_or_create_classifier(
     n_neighbors: int,
     distance_threshold: float,
     distance_mode: DistanceMode,
+    threshold_mode: ThresholdMode = "fixed",
 ) -> TapClassifier:
     """Load compatible registrations or return a new classifier."""
     if state_path is None or not state_path.exists():
@@ -48,6 +49,7 @@ def load_or_create_classifier(
             n_neighbors=n_neighbors,
             distance_threshold=distance_threshold,
             distance_mode=distance_mode,
+            threshold_mode=threshold_mode,
         )
 
     classifier = TapClassifier.load(state_path)
@@ -68,8 +70,26 @@ def load_or_create_classifier(
             f"state file uses distance mode {classifier.distance_mode!r}, "
             f"not {distance_mode!r}; use a compatible state file"
         )
+    if classifier.threshold_mode != threshold_mode:
+        raise ValueError(
+            f"state file uses threshold mode {classifier.threshold_mode!r}, "
+            f"not {threshold_mode!r}; use a compatible state file"
+        )
     print(f"[*] Loaded {len(classifier.X_data)} registration(s) from {state_path}")
     return classifier
+
+
+def classifier_status_lines(classifier: TapClassifier) -> list[str]:
+    """Format per-label rejection calibration for the interactive status command."""
+    lines: list[str] = []
+    for label in sorted(set(classifier.y_labels)):
+        calibration = classifier.threshold_calibrations.get(label)
+        source = "fallback" if calibration is None else calibration.source
+        lines.append(
+            f"    {label}: threshold={classifier.threshold_for_label(label):.4f} "
+            f"samples={classifier.y_labels.count(label)} calibration={source}"
+        )
+    return lines
 
 
 def run_application(arguments: argparse.Namespace) -> int:
@@ -87,6 +107,9 @@ def run_application(arguments: argparse.Namespace) -> int:
     distance_mode: DistanceMode = (
         "cosine" if arguments.model == "pann" else "standardized_euclidean"
     )
+    threshold_mode: ThresholdMode = arguments.threshold_mode
+    if threshold_mode is None:
+        threshold_mode = "auto" if arguments.model == "pann" else "fixed"
     threshold = arguments.distance_threshold
     if threshold is None:
         threshold = 0.20 if arguments.model == "pann" else 2.5
@@ -97,10 +120,12 @@ def run_application(arguments: argparse.Namespace) -> int:
         n_neighbors=arguments.neighbors,
         distance_threshold=threshold,
         distance_mode=distance_mode,
+        threshold_mode=threshold_mode,
     )
     print(
         f"[*] Classifier distance: {classifier.distance_mode} "
-        f"(rejection threshold: {classifier.distance_threshold:g})"
+        f"(threshold mode: {classifier.threshold_mode}, "
+        f"fallback/cap: {classifier.distance_threshold:g})"
     )
     metadata = {
         "feature_extractor": arguments.model,
@@ -158,6 +183,8 @@ def run_application(arguments: argparse.Namespace) -> int:
                     f"[*] mode={controller.mode} registrations={len(classifier.X_data)} "
                     f"listener_alive={audio_thread.is_alive()}"
                 )
+                for status_line in classifier_status_lines(classifier):
+                    print(status_line)
             elif command.startswith("register "):
                 label = user_input.split(" ", 1)[1]
                 controller.set_registration_mode(label, taps=arguments.registration_samples)
@@ -187,6 +214,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-state", action="store_true")
     parser.add_argument("--neighbors", type=int, default=3)
     parser.add_argument("--distance-threshold", type=float)
+    parser.add_argument("--threshold-mode", choices=("auto", "fixed"))
     parser.add_argument("--energy-threshold", type=float, default=0.015)
     parser.add_argument("--registration-samples", type=int, default=10)
     parser.add_argument("--monitor-port", type=int, default=8765)

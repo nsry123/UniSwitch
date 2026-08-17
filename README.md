@@ -68,9 +68,12 @@ At the prompt, enter `register desk`. Each threshold-triggered capture window is
 one registration example, even if energy detection finds multiple knocks inside
 that window. Registrations are saved to `state/registrations.npz` by default and
 loaded on the next startup. Enter `quit` or press Ctrl-C for a graceful shutdown.
-PANN embeddings use L2 normalization and cosine distance with a provisional
-default rejection threshold of `0.20`; the active metric and threshold are
-printed at startup.
+PANN embeddings use L2 normalization and cosine distance. By default, each
+label receives an automatic rejection threshold after five examples, based on
+its leave-one-out registration distances; `0.20` is the fallback and safety
+cap. Use `--threshold-mode fixed --distance-threshold VALUE` to restore one
+fixed threshold for every label. The active mode and cap are printed at startup,
+and the `status` command lists each label's threshold and calibration source.
 
 For the faster 30-value legacy feature extractor:
 
@@ -92,11 +95,11 @@ conda run -n univ-switch python -m scripts.evaluate \
   --save-model outputs/evaluated_classifier.npz
 ```
 
-The evaluator calibrates K and the unknown-rejection distance on the validation
-split, then reports known-label classification and unknown-rejection metrics on
-the test split. A label absent from the training split is treated as unknown.
-These metrics describe only the supplied manifest; the repository does not ship
-a dataset or claim model quality.
+The evaluator calibrates K and, for PANN, a rejection distance per label on the
+validation split, then reports known-label classification and unknown-rejection
+metrics on the test split. A label absent from the training split is treated as
+unknown. These metrics describe only the supplied manifest; the repository does
+not ship a dataset or claim model quality.
 
 ## Development checks
 

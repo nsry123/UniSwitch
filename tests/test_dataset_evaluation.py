@@ -101,7 +101,40 @@ def test_cosine_calibration_matches_runtime_distance_mode() -> None:
     report = evaluate_classifier(classifier, validation_x, validation_y)
 
     assert classifier.distance_mode == "cosine"
+    assert calibration.distance_thresholds == classifier.distance_thresholds
     assert calibration.known_end_to_end_accuracy == 1.0
     assert calibration.unknown_rejection_rate == 1.0
+    assert report.known_end_to_end_accuracy == 1.0
+    assert report.unknown_rejection_rate == 1.0
+
+
+def test_auto_calibration_uses_validation_impostors_per_label() -> None:
+    train_x = np.array([[1.0, 0.0]] * 5 + [[0.0, 1.0]] * 5)
+    train_y = np.array(["desk"] * 5 + ["wall"] * 5)
+    validation_x = np.array(
+        [
+            [1.0, 0.01],
+            [0.01, 1.0],
+            [0.8, 0.6],
+            [0.6, 0.8],
+        ]
+    )
+    validation_y = np.array(["desk", "wall", "unknown-a", "unknown-b"])
+
+    classifier, calibration = calibrate_classifier(
+        train_x,
+        train_y,
+        validation_x,
+        validation_y,
+        neighbor_candidates=(1,),
+        distance_mode="cosine",
+        threshold_mode="auto",
+        distance_threshold_cap=0.2,
+    )
+    report = evaluate_classifier(classifier, validation_x, validation_y)
+
+    assert classifier.threshold_calibrations["desk"].source == "validation"
+    assert classifier.threshold_calibrations["wall"].source == "validation"
+    assert calibration.distance_thresholds == classifier.distance_thresholds
     assert report.known_end_to_end_accuracy == 1.0
     assert report.unknown_rejection_rate == 1.0
