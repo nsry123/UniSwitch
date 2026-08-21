@@ -36,6 +36,25 @@
         </article>
       </section>
 
+      <section class="panel result-panel" id="result-panel" aria-live="polite">
+        <div class="result-copy">
+          <div class="result-heading">
+            <p class="eyebrow">Latest knock</p>
+            <span class="result-badge waiting" id="result-status">Waiting</span>
+          </div>
+          <h2 id="result-label">No result yet</h2>
+          <p class="result-reason" id="result-reason">
+            Classification details will appear after the next captured knock.
+          </p>
+        </div>
+        <dl class="result-details" aria-label="Latest classification measurements">
+          <div><dt>Candidate</dt><dd id="result-candidate">—</dd></div>
+          <div><dt>Confidence</dt><dd id="result-confidence">—</dd></div>
+          <div><dt>Score / radius</dt><dd id="result-distance">—</dd></div>
+          <div><dt>Margin</dt><dd id="result-margin">—</dd></div>
+        </dl>
+      </section>
+
       <section class="panel energy-panel">
         <div class="panel-heading">
           <div>

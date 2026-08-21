@@ -71,3 +71,19 @@ def test_default_controller_triggers_on_first_accepted_capture() -> None:
 
     assert decision.status is EventStatus.EVENT
     assert decision.label == "desk"
+
+
+def test_delete_class_updates_state_and_removes_empty_state_file(tmp_path) -> None:
+    state_path = tmp_path / "state.npz"
+    classifier = TapClassifier(n_neighbors=1, distance_threshold=2.5)
+    for label, center in (("desk", 0.0), ("wall", 10.0)):
+        for offset in (0.0, 0.01, -0.01):
+            classifier.register_tap(np.array([center + offset, center + 1.0]), label)
+    classifier.save(state_path)
+    controller = SwitchController(classifier, state_path=state_path)
+
+    assert controller.delete_class("desk") == 3
+    assert state_path.exists()
+    assert set(TapClassifier.load(state_path).y_labels) == {"wall"}
+    assert controller.delete_class("wall") == 3
+    assert not state_path.exists()

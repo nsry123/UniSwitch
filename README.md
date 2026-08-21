@@ -67,7 +67,10 @@ which prevents table ringing and threshold chatter from inflating the count.
 At the prompt, enter `register desk`. Each threshold-triggered capture window is
 one registration example, even if energy detection finds multiple knocks inside
 that window. Registrations are saved to `state/registrations.npz` by default and
-loaded on the next startup. Enter `quit` or press Ctrl-C for a graceful shutdown.
+loaded on the next startup. Enter `delete desk` to remove that class and all of
+its examples; deleting the final class also removes the empty state file. Enter
+`list` to show every registered label and its example count. Enter `quit` or
+press Ctrl-C for a graceful shutdown.
 PANN embeddings use L2 normalization and cosine distance. Each class becomes
 eligible after three examples and is represented by its prototype, registered
 exemplars, and leave-one-out spread. A prediction must pass both its

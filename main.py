@@ -6,6 +6,7 @@ import argparse
 import threading
 from pathlib import Path
 
+import numpy as np
 import pyaudio
 
 from src.audio.listener import AudioListener
@@ -154,9 +155,14 @@ def run_application(arguments: argparse.Namespace) -> int:
     def report_worker_error(error: Exception) -> None:
         print(f"\n[!] Audio processing stopped: {type(error).__name__}: {error}")
 
+    def process_capture(features: np.ndarray, tap_count: int) -> None:
+        decision = controller.process_capture(features, tap_count)
+        if monitor is not None:
+            monitor.publish_decision(decision)
+
     def listen() -> None:
         try:
-            listener.listen(controller.audio_callback, report_worker_error)
+            listener.listen(process_capture, report_worker_error)
         except Exception as error:
             listener.last_error = error
             report_worker_error(error)
@@ -171,6 +177,8 @@ def run_application(arguments: argparse.Namespace) -> int:
     print("\n--- Universal Switch Command Line ---")
     print("Commands:")
     print("  register <label> : Collect examples for a tap surface/location")
+    print("  delete <label>   : Delete a class and all of its registered examples")
+    print("  list             : List registered labels and example counts")
     print("  status           : Show listener and registration state")
     print("  quit             : Exit the application")
     print("-------------------------------------\n")
@@ -186,11 +194,29 @@ def run_application(arguments: argparse.Namespace) -> int:
                     f"[*] mode={controller.mode} registrations={len(classifier.X_data)} "
                     f"listener_alive={audio_thread.is_alive()}"
                 )
+            elif command == "list":
+                class_counts = classifier.class_counts()
+                if not class_counts:
+                    print("[*] No registered labels.")
+                else:
+                    print("[*] Registered labels:")
+                    for label, count in class_counts.items():
+                        suffix = "example" if count == 1 else "examples"
+                        print(f"    - {label}: {count} {suffix}")
             elif command.startswith("register "):
                 label = user_input.split(" ", 1)[1]
                 controller.set_registration_mode(label, taps=arguments.registration_samples)
+            elif command.startswith("delete "):
+                label = user_input.split(" ", 1)[1]
+                try:
+                    controller.delete_class(label)
+                except ValueError as error:
+                    print(f"[!] {error}")
             else:
-                print("[!] Unknown command. Use 'register <label>', 'status', or 'quit'.")
+                print(
+                    "[!] Unknown command. Use 'register <label>', 'delete <label>', "
+                    "'list', 'status', or 'quit'."
+                )
     except (EOFError, KeyboardInterrupt):
         print("\n[*] Shutting down...")
     finally:

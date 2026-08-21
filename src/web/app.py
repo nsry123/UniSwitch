@@ -13,6 +13,8 @@ from typing import Any
 
 import numpy as np
 
+from src.controller import EventDecision
+
 WEB_ROOT = Path(__file__).parent
 TEMPLATE_PATH = WEB_ROOT / "templates" / "monitor.html"
 STATIC_ROOT = WEB_ROOT / "static"
@@ -85,6 +87,8 @@ class MicrophoneMonitor:
         self._capturing = False
         self._waveform: list[float] = []
         self._updated_at = 0.0
+        self._result_sequence = 0
+        self._last_result: dict[str, Any] | None = None
         self._server: _MonitorHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
 
@@ -118,7 +122,83 @@ class MicrophoneMonitor:
                 "waveform": self._waveform,
                 "sampleRate": self.sample_rate,
                 "active": self._updated_at > 0 and time.monotonic() - self._updated_at < 1.0,
+                "resultSequence": self._result_sequence,
+                "lastResult": self._last_result,
             }
+
+    @staticmethod
+    def _finite(value: float | None) -> float | None:
+        return float(value) if value is not None and np.isfinite(value) else None
+
+    def publish_decision(self, decision: EventDecision) -> None:
+        """Publish the most recent classified or registration capture."""
+        classification = decision.classification
+        if classification is None:
+            result: dict[str, Any] = {
+                "status": decision.status.value,
+                "label": decision.label or "Registration capture",
+                "accepted": None,
+                "reason": "Stored as a registration example; classification was not run.",
+                "rejectionReason": None,
+                "tapCount": decision.tap_count,
+                "score": None,
+                "acceptanceRadius": None,
+                "margin": None,
+                "requiredMargin": None,
+                "confidence": None,
+                "candidate": None,
+                "probabilities": {},
+            }
+        else:
+            probabilities = dict(classification.probabilities)
+            candidate = (
+                max(probabilities, key=lambda label: probabilities[label])
+                if probabilities
+                else None
+            )
+            score = self._finite(classification.score)
+            radius = self._finite(classification.acceptance_radius)
+            margin = self._finite(classification.margin)
+            required_margin = self._finite(classification.required_margin)
+            confidence = max(probabilities.values()) if probabilities else None
+            if classification.accepted:
+                reason = (
+                    f"Score {score:.3f} is within the class radius {radius:.3f}."
+                    if margin is None
+                    else f"Score {score:.3f} is within radius {radius:.3f}; "
+                    f"margin {margin:.3f} clears the required {required_margin:.3f}."
+                )
+                if decision.status.value == "NONE":
+                    reason += " No action was emitted because confirmation or cooldown is active."
+            elif classification.rejection_reason == "distance":
+                reason = (
+                    f"Closest score {score:.3f} exceeds the class radius {radius:.3f}."
+                )
+            elif classification.rejection_reason == "margin":
+                reason = (
+                    f"The closest classes are ambiguous: margin {margin:.3f} is below "
+                    f"the required {required_margin:.3f}."
+                )
+            else:
+                reason = "No class has the three examples required for classification."
+            result = {
+                "status": decision.status.value,
+                "label": classification.label,
+                "accepted": classification.accepted,
+                "reason": reason,
+                "rejectionReason": classification.rejection_reason,
+                "tapCount": decision.tap_count,
+                "score": score,
+                "acceptanceRadius": radius,
+                "margin": margin,
+                "requiredMargin": required_margin,
+                "confidence": confidence,
+                "candidate": candidate,
+                "probabilities": probabilities,
+            }
+        with self._lock:
+            self._result_sequence += 1
+            self._last_result = result
 
     def start(self, open_browser: bool = True) -> None:
         """Start the local server and optionally open its page in a browser."""

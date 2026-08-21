@@ -53,6 +53,7 @@ class PredictionResult:
     score: float | None
     acceptance_radius: float | None
     margin: float | None
+    required_margin: float
     rejection_reason: str | None
 
 
@@ -262,12 +263,39 @@ class TapClassifier:
                 remaining = MIN_CLASS_SAMPLES - class_count
                 print(f"[*] Sample recorded. Need {remaining} more for '{normalized_label}'.")
 
+    def delete_class(self, label: str) -> int:
+        """Delete every registered example for a class and rebuild statistics."""
+        with self._lock:
+            normalized_label = self._validate_label(label)
+            matching = [
+                index
+                for index, registered_label in enumerate(self.y_labels)
+                if registered_label == normalized_label
+            ]
+            if not matching:
+                raise ValueError(f"class is not registered: {normalized_label!r}")
+            retained = [index for index in range(len(self.y_labels)) if index not in matching]
+            self.X_data = [self.X_data[index] for index in retained]
+            self.y_labels = [self.y_labels[index] for index in retained]
+            if not self.X_data:
+                self.feature_dim = None
+            self._fit_if_ready()
+            return len(matching)
+
+    def class_counts(self) -> dict[str, int]:
+        """Return registered labels and example counts in deterministic order."""
+        with self._lock:
+            return {
+                label: self.y_labels.count(label) for label in sorted(set(self.y_labels))
+            }
+
     def predict_detailed(self, feature_vector: np.ndarray) -> PredictionResult:
         """Return class probabilities and the open-set decision for one vector."""
         with self._lock:
             if not self.is_trained:
                 return PredictionResult(
                     "Unknown", False, MappingProxyType({}), None, None, None, None, None,
+                    self.margin_threshold,
                     "insufficient_class_samples",
                 )
             vector = self._validate_feature(feature_vector)
@@ -311,6 +339,7 @@ class TapClassifier:
                 best.score,
                 best.acceptance_radius,
                 margin,
+                self.margin_threshold,
                 rejection_reason,
             )
 

@@ -214,3 +214,27 @@ def test_schema_v2_is_upgraded_on_next_save(tmp_path) -> None:
         upgraded = json.loads(str(persisted["manifest"].item()))
     assert upgraded["schema_version"] == 3
     assert upgraded["prototype_weight"] == 0.5
+
+
+def test_delete_class_removes_examples_and_rebuilds_statistics() -> None:
+    classifier = TapClassifier(n_neighbors=1, distance_threshold=2.5)
+    for label, center in (("desk", 0.0), ("wall", 10.0)):
+        for offset in (0.0, 0.01, -0.01):
+            classifier.register_tap(np.array([center + offset, center + 1.0]), label)
+
+    deleted = classifier.delete_class("desk")
+
+    assert deleted == 3
+    assert set(classifier.y_labels) == {"wall"}
+    assert classifier.predict(np.array([10.0, 11.0])) == "wall"
+    with pytest.raises(ValueError, match="not registered"):
+        classifier.delete_class("desk")
+
+
+def test_class_counts_lists_all_labels_in_deterministic_order() -> None:
+    classifier = TapClassifier()
+    classifier.register_tap(np.ones(3), "wall")
+    classifier.register_tap(np.ones(3), "desk")
+    classifier.register_tap(np.ones(3), "wall")
+
+    assert classifier.class_counts() == {"desk": 1, "wall": 2}

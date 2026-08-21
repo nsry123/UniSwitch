@@ -7,12 +7,50 @@ const peakValue = document.querySelector("#peak-value");
 const captureState = document.querySelector("#capture-state");
 const sampleRate = document.querySelector("#sample-rate");
 const connectionStatus = document.querySelector("#connection-status");
+const resultPanel = document.querySelector("#result-panel");
+const resultStatus = document.querySelector("#result-status");
+const resultLabel = document.querySelector("#result-label");
+const resultReason = document.querySelector("#result-reason");
+const resultCandidate = document.querySelector("#result-candidate");
+const resultConfidence = document.querySelector("#result-confidence");
+const resultDistance = document.querySelector("#result-distance");
+const resultMargin = document.querySelector("#result-margin");
 
 const history = [];
 const maxPoints = 240;
 let latestWaveform = [];
 let threshold = 0.015;
 let lastSequence = -1;
+let lastResultSequence = -1;
+
+function renderResult(result) {
+  if (!result) return;
+  let state = "registration";
+  let badge = "Registered";
+  if (result.accepted === true) {
+    state = "accepted";
+    badge = result.status === "EVENT" ? "Accepted" : "Accepted · suppressed";
+  } else if (result.accepted === false) {
+    state = "unknown";
+    badge = "Unknown";
+  }
+  resultPanel.className = `panel result-panel ${state}`;
+  resultStatus.className = `result-badge ${state}`;
+  resultStatus.textContent = badge;
+  resultLabel.textContent = result.label;
+  resultReason.textContent = result.reason;
+  resultCandidate.textContent = result.candidate || "—";
+  resultConfidence.textContent =
+    result.confidence == null ? "—" : `${(result.confidence * 100).toFixed(1)}%`;
+  resultDistance.textContent =
+    result.score == null || result.acceptanceRadius == null
+      ? "—"
+      : `${result.score.toFixed(3)} / ${result.acceptanceRadius.toFixed(3)}`;
+  resultMargin.textContent =
+    result.margin == null
+      ? result.accepted == null ? "—" : "Single class"
+      : `${result.margin.toFixed(3)} / ${result.requiredMargin.toFixed(3)} required`;
+}
 
 function fitCanvas(canvas) {
   const ratio = window.devicePixelRatio || 1;
@@ -126,6 +164,10 @@ async function poll() {
       if (history.length > maxPoints) history.shift();
       latestWaveform = state.waveform;
       lastSequence = state.sequence;
+    }
+    if (state.resultSequence !== lastResultSequence) {
+      renderResult(state.lastResult);
+      lastResultSequence = state.resultSequence;
     }
     energyValue.textContent = state.energy.toFixed(4);
     thresholdValue.textContent = state.threshold.toFixed(4);

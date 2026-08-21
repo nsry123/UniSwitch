@@ -98,6 +98,25 @@ class SwitchController:
             self.target_label = None
         print("\n[*] EXECUTION MODE: Actively listening")
 
+    def delete_class(self, label: str) -> int:
+        """Delete one class and synchronize the persisted registration state."""
+        with self._lock:
+            deleted = self.classifier.delete_class(label)
+            if self._pending_label == label.strip():
+                self._pending_label = None
+                self._pending_count = 0
+            if self.mode == "register" and self.target_label == label.strip():
+                self.mode = "execute"
+                self.target_label = None
+                self.samples_collected = 0
+            if self.state_path is not None:
+                if self.classifier.X_data:
+                    self.classifier.save(self.state_path, self.state_metadata)
+                else:
+                    self.state_path.unlink(missing_ok=True)
+            print(f"[*] Deleted class '{label.strip()}' ({deleted} example(s)).")
+            return deleted
+
     def process_capture(self, features: np.ndarray, tap_count: int) -> EventDecision:
         """Route a capture through registration, classification, and hysteresis."""
         if tap_count < 0:
@@ -120,7 +139,7 @@ class SwitchController:
                     print(f"[+] Successfully learned '{label}'. Returning to execute mode.")
                     self.mode = "execute"
                     self.target_label = None
-                return EventDecision(EventStatus.NONE, None, None, tap_count)
+                return EventDecision(EventStatus.NONE, label, None, tap_count)
 
             if self.mode != "execute":
                 raise RuntimeError(f"unsupported controller mode: {self.mode}")
