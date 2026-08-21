@@ -224,6 +224,41 @@ def write_schema_v2_cosine_state(path) -> None:
     )
 
 
+def write_schema_v3_cosine_state(path) -> None:
+    features = np.vstack(
+        [unit_vector(angle) for angle in np.linspace(0.0, 0.1, 5)]
+        + [unit_vector(angle) for angle in np.linspace(1.0, 1.1, 5)]
+    )
+    thresholds = {"desk": 0.05, "wall": 0.05}
+    calibrations = {
+        label: {
+            "threshold": threshold,
+            "sample_count": 5,
+            "median_distance": 0.01,
+            "max_distance": 0.02,
+            "source": "registration",
+        }
+        for label, threshold in thresholds.items()
+    }
+    manifest = {
+        "schema_version": 3,
+        "n_neighbors": 1,
+        "distance_threshold": 0.2,
+        "distance_mode": "cosine",
+        "threshold_mode": "auto",
+        "distance_thresholds": thresholds,
+        "threshold_calibrations": calibrations,
+        "feature_dim": 2,
+        "metadata": {"feature_extractor": "pann"},
+    }
+    np.savez_compressed(
+        path,
+        features=features,
+        labels=np.array(["desk"] * 5 + ["wall"] * 5),
+        manifest=np.asarray(json.dumps(manifest)),
+    )
+
+
 def test_schema_v1_legacy_state_remains_compatible(tmp_path) -> None:
     path = tmp_path / "legacy-v1.npz"
     write_schema_v1_state(path, "legacy")
@@ -249,12 +284,25 @@ def test_schema_v2_cosine_state_recomputes_auto_thresholds(tmp_path) -> None:
     restored = TapClassifier.load(path)
 
     assert restored.threshold_mode == "auto"
+    assert restored.decision_mode == "class_balanced"
     assert restored.threshold_for_label("desk") < 0.2
     assert restored.threshold_calibrations["desk"].source == "registration"
 
 
-def test_schema_v3_preserves_validation_calibration(tmp_path) -> None:
+def test_schema_v3_cosine_state_recomputes_separation_only(tmp_path) -> None:
     path = tmp_path / "pann-v3.npz"
+    write_schema_v3_cosine_state(path)
+
+    restored = TapClassifier.load(path)
+
+    assert restored.threshold_for_label("desk") == 0.05
+    assert restored.decision_mode == "class_balanced"
+    assert restored.separation_calibrations["desk"].source == "registration"
+    assert restored.separation_calibrations["wall"].source == "registration"
+
+
+def test_schema_v4_preserves_distance_and_separation_calibration(tmp_path) -> None:
+    path = tmp_path / "pann-v4.npz"
     classifier = TapClassifier(
         n_neighbors=1,
         distance_threshold=0.2,
@@ -264,6 +312,9 @@ def test_schema_v3_preserves_validation_calibration(tmp_path) -> None:
     for angle in (0.0, 0.1, 0.2, 0.3, 0.4):
         classifier.register_tap(unit_vector(angle), "desk")
     classifier.set_validation_calibration("desk", 0.05, np.array([0.01, 0.02]))
+    classifier.set_validation_separation_calibration(
+        "desk", 0.25, np.array([0.3, 0.4]), 1.0
+    )
     classifier.save(path, {"feature_extractor": "pann"})
 
     restored = TapClassifier.load(path)
@@ -272,3 +323,159 @@ def test_schema_v3_preserves_validation_calibration(tmp_path) -> None:
     assert restored.threshold_for_label("desk") == 0.05
     assert restored.threshold_calibrations["desk"].source == "validation"
     assert restored.threshold_calibrations["desk"].sample_count == 2
+    assert restored.separation_threshold_for_label("desk") == 0.25
+    assert restored.separation_calibrations["desk"].source == "validation"
+
+
+def register_vectors(
+    classifier: TapClassifier, label: str, vectors: list[np.ndarray]
+) -> None:
+    for vector in vectors:
+        classifier.register_tap(vector, label)
+
+
+def test_three_way_score_tie_is_rejected_as_ambiguous() -> None:
+    classifier = TapClassifier(
+        n_neighbors=3,
+        distance_threshold=1.0,
+        distance_mode="cosine",
+        separation_threshold=0.15,
+    )
+    register_vectors(classifier, "a", [np.array([1.0, 0.0, 0.0])] * 3)
+    register_vectors(classifier, "b", [np.array([0.0, 1.0, 0.0])] * 3)
+    register_vectors(classifier, "c", [np.array([0.0, 0.0, 1.0])] * 3)
+
+    decision = classifier.classify(np.array([1.0, 1.0, 1.0]))
+
+    assert decision.accepted is False
+    assert decision.rejection_reason == "ambiguous"
+    assert decision.separation == pytest.approx(0.0, abs=1e-12)
+
+
+def test_class_balanced_scores_ignore_registration_count_imbalance() -> None:
+    classifier = TapClassifier(
+        n_neighbors=3,
+        distance_threshold=1.0,
+        distance_mode="cosine",
+    )
+    register_vectors(classifier, "many", [unit_vector(1.0)] * 20)
+    register_vectors(classifier, "few", [unit_vector(0.0)] * 3)
+
+    decision = classifier.classify_without_rejection(unit_vector(0.05))
+
+    assert decision.predicted_label == "few"
+
+
+def test_isolated_wrong_class_outlier_cannot_outvote_consistent_class() -> None:
+    classifier = TapClassifier(
+        n_neighbors=3,
+        distance_threshold=1.0,
+        distance_mode="cosine",
+    )
+    register_vectors(
+        classifier,
+        "consistent",
+        [unit_vector(0.05), unit_vector(0.06), unit_vector(0.07)],
+    )
+    register_vectors(
+        classifier,
+        "outlier",
+        [unit_vector(0.0), unit_vector(1.5), unit_vector(1.6)],
+    )
+
+    decision = classifier.classify_without_rejection(unit_vector(0.0))
+
+    assert decision.predicted_label == "consistent"
+
+
+def test_separation_rejects_close_scores_and_accepts_clear_winner() -> None:
+    classifier = TapClassifier(
+        n_neighbors=3,
+        distance_threshold=1.0,
+        distance_mode="cosine",
+        separation_threshold=0.15,
+    )
+    register_vectors(classifier, "left", [unit_vector(0.0)] * 3)
+    register_vectors(classifier, "right", [unit_vector(0.1)] * 3)
+
+    ambiguous = classifier.classify(unit_vector(0.049))
+    clear = classifier.classify(unit_vector(0.0))
+
+    assert ambiguous.rejection_reason == "ambiguous"
+    assert clear.accepted is True
+    assert clear.predicted_label == "left"
+
+
+def test_predict_logs_ambiguity_scores_and_required_margin(capsys) -> None:
+    classifier = TapClassifier(
+        n_neighbors=1,
+        distance_threshold=1.0,
+        distance_mode="cosine",
+        separation_threshold=0.15,
+    )
+    register_vectors(classifier, "left", [unit_vector(0.0)])
+    register_vectors(classifier, "right", [unit_vector(0.1)])
+    capsys.readouterr()
+
+    assert classifier.predict(unit_vector(0.05)) == "Unknown"
+    output = capsys.readouterr().out
+
+    assert "Ignored: ambiguous" in output
+    assert "Runner-up:" in output
+    assert "Scores:" in output
+    assert "Separation:" in output
+
+
+def test_new_surface_recalibrates_existing_separation() -> None:
+    classifier = TapClassifier(
+        n_neighbors=1,
+        distance_threshold=0.2,
+        distance_mode="cosine",
+        threshold_mode="auto",
+    )
+    register_vectors(
+        classifier, "desk", [unit_vector(angle) for angle in np.linspace(0.0, 0.1, 5)]
+    )
+    assert classifier.separation_calibrations["desk"].source == "fallback"
+
+    register_vectors(
+        classifier, "wall", [unit_vector(angle) for angle in np.linspace(1.0, 1.1, 5)]
+    )
+
+    assert classifier.separation_calibrations["desk"].source == "registration"
+    assert classifier.separation_calibrations["desk"].classification_accuracy == 1.0
+
+
+def test_distance_and_ambiguity_have_distinct_rejection_reasons() -> None:
+    classifier = TapClassifier(
+        n_neighbors=1,
+        distance_threshold=0.01,
+        distance_mode="cosine",
+        separation_threshold=0.15,
+    )
+    register_vectors(classifier, "left", [unit_vector(0.0)])
+    register_vectors(classifier, "right", [unit_vector(0.1)])
+
+    ambiguous = classifier.classify(unit_vector(0.05))
+    distant = classifier.classify(unit_vector(2.0))
+
+    assert ambiguous.rejection_reason == "ambiguous"
+    assert distant.rejection_reason == "distance"
+
+
+def test_single_surface_skips_separation_and_legacy_stays_uniform_knn() -> None:
+    cosine = TapClassifier(
+        n_neighbors=3,
+        distance_threshold=1.0,
+        distance_mode="cosine",
+    )
+    register_vectors(cosine, "desk", [unit_vector(0.0)] * 3)
+    cosine_decision = cosine.classify(unit_vector(0.1))
+
+    legacy = trained_classifier()
+    legacy_decision = legacy.classify(np.array([1.0, 2.0, 3.0]))
+
+    assert cosine_decision.accepted is True
+    assert cosine_decision.separation is None
+    assert legacy.decision_mode == "uniform_knn"
+    assert legacy_decision.runner_up_label is None

@@ -53,6 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=PANN_CHECKPOINT_PATH)
     parser.add_argument("--skip-checkpoint-verification", action="store_true")
     parser.add_argument("--neighbors", type=int, nargs="+", default=[1, 3, 5, 7])
+    parser.add_argument("--separation-threshold", type=float, default=0.15)
     parser.add_argument("--save-model", type=Path)
     return parser.parse_args()
 
@@ -80,6 +81,7 @@ def main(arguments: argparse.Namespace) -> int:
         distance_mode="cosine" if arguments.model == "pann" else "standardized_euclidean",
         threshold_mode="auto" if arguments.model == "pann" else "fixed",
         distance_threshold_cap=0.20 if arguments.model == "pann" else None,
+        separation_threshold=arguments.separation_threshold,
     )
     report = evaluate_classifier(classifier, test_features, test_labels)
     result = {"calibration": calibration.__dict__, "test": report.to_dict()}

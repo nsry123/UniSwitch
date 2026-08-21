@@ -74,6 +74,10 @@ its leave-one-out registration distances; `0.20` is the fallback and safety
 cap. Use `--threshold-mode fixed --distance-threshold VALUE` to restore one
 fixed threshold for every label. The active mode and cap are printed at startup,
 and the `status` command lists each label's threshold and calibration source.
+For PANN, `--neighbors` is the number of nearest examples scored per class.
+The winning class must also beat the runner-up by a normalized separation
+margin; ambiguous decisions return `Unknown`. The default margin floor is
+`0.15` and can be changed with `--separation-threshold`.
 
 For the faster 30-value legacy feature extractor:
 
@@ -95,11 +99,12 @@ conda run -n univ-switch python -m scripts.evaluate \
   --save-model outputs/evaluated_classifier.npz
 ```
 
-The evaluator calibrates K and, for PANN, a rejection distance per label on the
-validation split, then reports known-label classification and unknown-rejection
-metrics on the test split. A label absent from the training split is treated as
-unknown. These metrics describe only the supplied manifest; the repository does
-not ship a dataset or claim model quality.
+The evaluator calibrates K and, for PANN, rejection distance and class-separation
+thresholds per label on the validation split. It reports known-label confusion,
+accepted accuracy, ambiguity rejection, per-label recall, separation summaries,
+and unknown rejection on the test split. A label absent from the training split
+is treated as unknown. These metrics describe only the supplied manifest; the
+repository does not ship a dataset or claim model quality.
 
 ## Development checks
 

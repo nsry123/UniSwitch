@@ -42,6 +42,7 @@ def load_or_create_classifier(
     distance_threshold: float,
     distance_mode: DistanceMode,
     threshold_mode: ThresholdMode = "fixed",
+    separation_threshold: float = 0.15,
 ) -> TapClassifier:
     """Load compatible registrations or return a new classifier."""
     if state_path is None or not state_path.exists():
@@ -50,6 +51,7 @@ def load_or_create_classifier(
             distance_threshold=distance_threshold,
             distance_mode=distance_mode,
             threshold_mode=threshold_mode,
+            separation_threshold=separation_threshold,
         )
 
     classifier = TapClassifier.load(state_path)
@@ -75,6 +77,14 @@ def load_or_create_classifier(
             f"state file uses threshold mode {classifier.threshold_mode!r}, "
             f"not {threshold_mode!r}; use a compatible state file"
         )
+    expected_decision_mode = (
+        "class_balanced" if model_name == "pann" else "uniform_knn"
+    )
+    if classifier.decision_mode != expected_decision_mode:
+        raise ValueError(
+            f"state file uses decision mode {classifier.decision_mode!r}, "
+            f"not {expected_decision_mode!r}; use a compatible state file"
+        )
     print(f"[*] Loaded {len(classifier.X_data)} registration(s) from {state_path}")
     return classifier
 
@@ -85,9 +95,28 @@ def classifier_status_lines(classifier: TapClassifier) -> list[str]:
     for label in sorted(set(classifier.y_labels)):
         calibration = classifier.threshold_calibrations.get(label)
         source = "fallback" if calibration is None else calibration.source
+        separation_calibration = classifier.separation_calibrations.get(label)
+        separation_source = (
+            "fallback"
+            if separation_calibration is None
+            else separation_calibration.source
+        )
+        calibration_accuracy = (
+            None
+            if separation_calibration is None
+            else separation_calibration.classification_accuracy
+        )
+        accuracy_text = (
+            "n/a"
+            if calibration_accuracy is None
+            else f"{calibration_accuracy:.1%}"
+        )
         lines.append(
-            f"    {label}: threshold={classifier.threshold_for_label(label):.4f} "
-            f"samples={classifier.y_labels.count(label)} calibration={source}"
+            f"    {label}: distance={classifier.threshold_for_label(label):.4f} "
+            f"({source}) separation="
+            f"{classifier.separation_threshold_for_label(label):.4f} "
+            f"({separation_source}) class_accuracy={accuracy_text} "
+            f"samples={classifier.y_labels.count(label)}"
         )
     return lines
 
@@ -121,11 +150,14 @@ def run_application(arguments: argparse.Namespace) -> int:
         distance_threshold=threshold,
         distance_mode=distance_mode,
         threshold_mode=threshold_mode,
+        separation_threshold=arguments.separation_threshold,
     )
     print(
         f"[*] Classifier distance: {classifier.distance_mode} "
-        f"(threshold mode: {classifier.threshold_mode}, "
-        f"fallback/cap: {classifier.distance_threshold:g})"
+        f"(decision mode: {classifier.decision_mode}, "
+        f"threshold mode: {classifier.threshold_mode}, "
+        f"fallback/cap: {classifier.distance_threshold:g}, "
+        f"separation floor: {classifier.separation_threshold:g})"
     )
     metadata = {
         "feature_extractor": arguments.model,
@@ -212,9 +244,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-checkpoint-verification", action="store_true")
     parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument("--no-state", action="store_true")
-    parser.add_argument("--neighbors", type=int, default=3)
+    parser.add_argument(
+        "--neighbors",
+        type=int,
+        default=3,
+        help="neighbors per class for PANN; global K for legacy",
+    )
     parser.add_argument("--distance-threshold", type=float)
     parser.add_argument("--threshold-mode", choices=("auto", "fixed"))
+    parser.add_argument(
+        "--separation-threshold",
+        type=float,
+        default=0.15,
+        help="minimum normalized best-versus-runner-up margin for PANN",
+    )
     parser.add_argument("--energy-threshold", type=float, default=0.015)
     parser.add_argument("--registration-samples", type=int, default=10)
     parser.add_argument("--monitor-port", type=int, default=8765)

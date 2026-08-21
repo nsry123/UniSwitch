@@ -3,6 +3,7 @@ import csv
 import numpy as np
 import pytest
 
+from src.ml.classifier import TapClassifier
 from src.ml.dataset import REQUIRED_COLUMNS, load_manifest
 from src.ml.evaluation import calibrate_classifier, evaluate_classifier
 
@@ -135,6 +136,31 @@ def test_auto_calibration_uses_validation_impostors_per_label() -> None:
 
     assert classifier.threshold_calibrations["desk"].source == "validation"
     assert classifier.threshold_calibrations["wall"].source == "validation"
+    assert classifier.separation_calibrations["desk"].source == "validation"
+    assert classifier.separation_calibrations["wall"].source == "validation"
     assert calibration.distance_thresholds == classifier.distance_thresholds
+    assert calibration.separation_thresholds == classifier.separation_thresholds
     assert report.known_end_to_end_accuracy == 1.0
     assert report.unknown_rejection_rate == 1.0
+    assert report.known_confusion_matrix["desk"]["desk"] == 1
+    assert report.per_label_recall == {"desk": 1.0, "wall": 1.0}
+    assert report.separation_summary["desk"]["count"] > 0
+
+
+def test_evaluation_reports_ambiguity_rejections() -> None:
+    classifier = TapClassifier(
+        n_neighbors=1,
+        distance_threshold=1.0,
+        distance_mode="cosine",
+        separation_threshold=0.15,
+    )
+    classifier.register_tap(np.array([1.0, 0.0]), "left")
+    classifier.register_tap(np.array([np.cos(0.1), np.sin(0.1)]), "right")
+    features = np.array([[np.cos(0.05), np.sin(0.05)], [1.0, 0.0]])
+    labels = np.array(["left", "left"])
+
+    report = evaluate_classifier(classifier, features, labels)
+
+    assert report.ambiguity_rejection_rate == 0.5
+    assert report.known_confusion_matrix["left"]["Unknown"] == 1
+    assert report.known_accepted_accuracy == 1.0
