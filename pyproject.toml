@@ -15,6 +15,7 @@ dependencies = [
     "scikit-learn==1.8.0",
     "scipy==1.17.1",
     "torch==2.11.0",
+    "torchaudio==2.11.0",
     "torchlibrosa==0.1.0",
 ]
 
@@ -28,6 +29,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["src*"]
 
+[tool.setuptools.package-data]
+"src.audio.beats" = ["LICENSE", "UPSTREAM.md"]
+
 [tool.pytest.ini_options]
 addopts = "-q"
 markers = [
@@ -36,6 +40,7 @@ markers = [
 testpaths = ["tests"]
 
 [tool.ruff]
+extend-exclude = ["src/audio/beats/"]
 line-length = 100
 target-version = "py311"
 
@@ -47,4 +52,8 @@ python_version = "3.11"
 check_untyped_defs = true
 ignore_missing_imports = true
 warn_unused_ignores = true
-exclude = ["notebooks/"]
+exclude = ["notebooks/", "src/audio/beats/"]
+
+[[tool.mypy.overrides]]
+module = ["src.audio.beats.*"]
+ignore_errors = true

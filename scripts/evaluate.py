@@ -10,7 +10,14 @@ from pathlib import Path
 import librosa
 import numpy as np
 
-from src.audio.processor import PANN_CHECKPOINT_PATH, SignalProcessor
+from src.audio.processor import (
+    BEATS_CHECKPOINT_PATH,
+    BEATS_EMBEDDING_DIM,
+    BEATS_POOLING,
+    BEATS_SOURCE_REVISION,
+    PANN_CHECKPOINT_PATH,
+    SignalProcessor,
+)
 from src.ml.dataset import AudioRecord, load_manifest
 from src.ml.evaluation import calibrate_classifier, evaluate_classifier
 
@@ -49,8 +56,8 @@ def extract_split(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--model", choices=("legacy", "pann"), default="legacy")
-    parser.add_argument("--checkpoint", type=Path, default=PANN_CHECKPOINT_PATH)
+    parser.add_argument("--model", choices=("beats", "legacy", "pann"), default="beats")
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--skip-checkpoint-verification", action="store_true")
     parser.add_argument("--neighbors", type=int, nargs="+", default=[1, 3, 5, 7])
     parser.add_argument("--save-model", type=Path)
@@ -59,14 +66,20 @@ def parse_args() -> argparse.Namespace:
 
 def main(arguments: argparse.Namespace) -> int:
     records = load_manifest(arguments.manifest)
+    checkpoint_path = arguments.checkpoint
+    if checkpoint_path is None:
+        checkpoint_path = {
+            "beats": BEATS_CHECKPOINT_PATH,
+            "pann": PANN_CHECKPOINT_PATH,
+        }.get(arguments.model)
     processor = SignalProcessor(
         model=arguments.model,
-        checkpoint_path=arguments.checkpoint,
+        checkpoint_path=checkpoint_path,
         verify_checkpoint=not arguments.skip_checkpoint_verification,
     )
     checkpoint_sha256 = None
-    if arguments.model == "pann":
-        checkpoint_sha256 = processor.validate_pann_checkpoint()
+    if arguments.model in {"beats", "pann"}:
+        checkpoint_sha256 = processor.prepare()
 
     train_features, train_labels = extract_split(records, "train", processor)
     validation_features, validation_labels = extract_split(records, "validation", processor)
@@ -77,7 +90,9 @@ def main(arguments: argparse.Namespace) -> int:
         validation_features,
         validation_labels,
         arguments.neighbors,
-        distance_mode="cosine" if arguments.model == "pann" else "standardized_euclidean",
+        distance_mode=(
+            "cosine" if arguments.model in {"beats", "pann"} else "standardized_euclidean"
+        ),
     )
     report = evaluate_classifier(classifier, test_features, test_labels)
     result = {"calibration": calibration.__dict__, "test": report.to_dict()}
@@ -85,15 +100,24 @@ def main(arguments: argparse.Namespace) -> int:
 
     if arguments.save_model is not None:
         manifest_digest = hashlib.sha256(arguments.manifest.read_bytes()).hexdigest()
+        metadata = {
+            "feature_extractor": arguments.model,
+            "checkpoint_sha256": checkpoint_sha256,
+            "sample_rate": processor.sample_rate,
+            "dataset_manifest_sha256": manifest_digest,
+            "calibration": calibration.__dict__,
+        }
+        if arguments.model == "beats":
+            metadata.update(
+                {
+                    "embedding_dim": BEATS_EMBEDDING_DIM,
+                    "pooling": BEATS_POOLING,
+                    "source_revision": BEATS_SOURCE_REVISION,
+                }
+            )
         classifier.save(
             arguments.save_model,
-            metadata={
-                "feature_extractor": arguments.model,
-                "checkpoint_sha256": checkpoint_sha256,
-                "sample_rate": processor.sample_rate,
-                "dataset_manifest_sha256": manifest_digest,
-                "calibration": calibration.__dict__,
-            },
+            metadata=metadata,
         )
         print(f"Saved calibrated classifier to {arguments.save_model}")
     return 0

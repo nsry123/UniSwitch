@@ -4,18 +4,48 @@ from __future__ import annotations
 
 import argparse
 import threading
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pyaudio
 
 from src.audio.listener import AudioListener
-from src.audio.processor import PANN_CHECKPOINT_PATH, SignalProcessor
+from src.audio.processor import (
+    BEATS_CHECKPOINT_PATH,
+    BEATS_EMBEDDING_DIM,
+    BEATS_POOLING,
+    BEATS_SOURCE_REVISION,
+    PANN_CHECKPOINT_PATH,
+    SignalProcessor,
+)
 from src.controller import SwitchController
 from src.ml.classifier import DistanceMode, TapClassifier
 from src.web.app import MicrophoneMonitor
 
-DEFAULT_STATE_PATH = Path("state/registrations.npz")
+DEFAULT_STATE_PATHS = {
+    "beats": Path("state/beats-registrations.npz"),
+    "pann": Path("state/registrations.npz"),
+    "legacy": Path("state/legacy-registrations.npz"),
+}
+DEFAULT_CHECKPOINT_PATHS = {
+    "beats": BEATS_CHECKPOINT_PATH,
+    "pann": PANN_CHECKPOINT_PATH,
+}
+DEFAULT_DISTANCE_THRESHOLDS = {"beats": 0.15, "pann": 0.20, "legacy": 2.5}
+
+
+def resolve_state_path(model_name: str, requested: Path | None) -> Path:
+    """Resolve an explicit or model-specific default registration path."""
+    return requested if requested is not None else DEFAULT_STATE_PATHS[model_name]
+
+
+def resolve_checkpoint_path(model_name: str, requested: Path | None) -> Path | None:
+    """Resolve an explicit or model-specific neural checkpoint path."""
+    if requested is not None:
+        return requested
+    return DEFAULT_CHECKPOINT_PATHS.get(model_name)
 
 
 def list_input_devices() -> None:
@@ -38,7 +68,7 @@ def list_input_devices() -> None:
 def load_or_create_classifier(
     state_path: Path | None,
     model_name: str,
-    checkpoint_sha256: str | None,
+    extractor_metadata: Mapping[str, Any],
     n_neighbors: int,
     distance_threshold: float,
     distance_mode: DistanceMode,
@@ -61,17 +91,25 @@ def load_or_create_classifier(
 
     classifier = TapClassifier.load(state_path)
     saved_model = classifier.metadata.get("feature_extractor")
-    saved_sha256 = classifier.metadata.get("checkpoint_sha256")
     if saved_model != model_name:
         raise ValueError(
             f"state file uses feature extractor {saved_model!r}, not {model_name!r}; "
             "select the matching --model or a different --state-path"
         )
-    if model_name == "pann" and saved_sha256 != checkpoint_sha256:
+    if model_name in {"beats", "pann"} and classifier.metadata.get(
+        "checkpoint_sha256"
+    ) != extractor_metadata.get("checkpoint_sha256"):
         raise ValueError(
-            "state file checkpoint hash differs from the selected PANN checkpoint; "
+            f"state file checkpoint hash differs from the selected {model_name} checkpoint; "
             "use a compatible state file"
         )
+    if model_name == "beats":
+        for key in ("sample_rate", "embedding_dim", "pooling", "source_revision"):
+            if classifier.metadata.get(key) != extractor_metadata.get(key):
+                raise ValueError(
+                    f"state file BEATs {key} differs from the selected encoder; "
+                    "use a compatible state file"
+                )
     if classifier.distance_mode != distance_mode:
         raise ValueError(
             f"state file uses distance mode {classifier.distance_mode!r}, "
@@ -83,26 +121,44 @@ def load_or_create_classifier(
 
 def run_application(arguments: argparse.Namespace) -> int:
     """Start capture and serve the interactive command loop."""
+    checkpoint_path = resolve_checkpoint_path(arguments.model, arguments.checkpoint)
     processor = SignalProcessor(
         model=arguments.model,
-        checkpoint_path=arguments.checkpoint,
+        checkpoint_path=checkpoint_path,
         verify_checkpoint=not arguments.skip_checkpoint_verification,
     )
     checkpoint_sha256 = None
-    if arguments.model == "pann":
+    if arguments.model in {"beats", "pann"}:
         checkpoint_sha256 = processor.prepare()
 
-    state_path = None if arguments.no_state else arguments.state_path
+    state_path = (
+        None
+        if arguments.no_state
+        else resolve_state_path(arguments.model, arguments.state_path)
+    )
     distance_mode: DistanceMode = (
-        "cosine" if arguments.model == "pann" else "standardized_euclidean"
+        "cosine" if arguments.model in {"beats", "pann"} else "standardized_euclidean"
     )
     threshold = arguments.distance_threshold
     if threshold is None:
-        threshold = 0.20 if arguments.model == "pann" else 2.5
+        threshold = DEFAULT_DISTANCE_THRESHOLDS[arguments.model]
+    metadata = {
+        "feature_extractor": arguments.model,
+        "checkpoint_sha256": checkpoint_sha256,
+        "sample_rate": processor.sample_rate,
+    }
+    if arguments.model == "beats":
+        metadata.update(
+            {
+                "embedding_dim": BEATS_EMBEDDING_DIM,
+                "pooling": BEATS_POOLING,
+                "source_revision": BEATS_SOURCE_REVISION,
+            }
+        )
     classifier = load_or_create_classifier(
         state_path=state_path,
         model_name=arguments.model,
-        checkpoint_sha256=checkpoint_sha256,
+        extractor_metadata=metadata,
         n_neighbors=arguments.neighbors,
         distance_threshold=threshold,
         distance_mode=distance_mode,
@@ -121,11 +177,6 @@ def run_application(arguments: argparse.Namespace) -> int:
         f"margin={classifier.margin_threshold:g} "
         f"temperature={classifier.probability_temperature:g}"
     )
-    metadata = {
-        "feature_extractor": arguments.model,
-        "checkpoint_sha256": checkpoint_sha256,
-        "sample_rate": processor.sample_rate,
-    }
     controller = SwitchController(
         classifier,
         state_path=state_path,
@@ -234,10 +285,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--device-index", type=int, default=None)
-    parser.add_argument("--model", choices=("pann", "legacy"), default="pann")
-    parser.add_argument("--checkpoint", type=Path, default=PANN_CHECKPOINT_PATH)
+    parser.add_argument("--model", choices=("beats", "pann", "legacy"), default="beats")
+    parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--skip-checkpoint-verification", action="store_true")
-    parser.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    parser.add_argument("--state-path", type=Path)
     parser.add_argument("--no-state", action="store_true")
     parser.add_argument("--neighbors", type=int, default=3)
     parser.add_argument("--distance-threshold", type=float)

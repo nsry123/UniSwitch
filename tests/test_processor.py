@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from src.audio.processor import SignalProcessor
+from src.audio.processor import BEATS_CHECKPOINT_PATH, BEATS_EMBEDDING_DIM, SignalProcessor
 
 
 def synthetic_three_knocks(sample_rate: int = 16000) -> np.ndarray:
@@ -26,7 +26,7 @@ def test_legacy_processor_counts_and_extracts_deterministically() -> None:
     np.testing.assert_array_equal(first, second)
 
 
-@pytest.mark.parametrize("model", ["legacy", "pann"])
+@pytest.mark.parametrize("model", ["beats", "legacy", "pann"])
 def test_threshold_counter_counts_deliberate_knock_pattern(model: str) -> None:
     processor = SignalProcessor(model=model)
     waveform = synthetic_three_knocks(processor.sample_rate)
@@ -103,6 +103,7 @@ def test_prepare_is_no_op_for_legacy_processor() -> None:
     processor = SignalProcessor(model="legacy")
 
     assert processor.prepare() is None
+    assert processor.checkpoint_path is None
 
 
 def test_prepare_eagerly_loads_and_caches_pann(monkeypatch) -> None:
@@ -119,3 +120,97 @@ def test_prepare_eagerly_loads_and_caches_pann(monkeypatch) -> None:
     assert processor.prepare() == "test-sha256"
     assert processor.prepare() == "test-sha256"
     assert load_calls == [str(processor.checkpoint_path)]
+
+
+def test_beats_is_default_and_uses_16khz() -> None:
+    processor = SignalProcessor()
+
+    assert processor.model == "beats"
+    assert processor.sample_rate == 16000
+    assert SignalProcessor(model="beats", sample_rate=8000).sample_rate == 16000
+    assert processor.checkpoint_path == BEATS_CHECKPOINT_PATH
+    assert SignalProcessor(model="default").model == "beats"
+
+
+def test_prepare_eagerly_loads_and_caches_beats(monkeypatch) -> None:
+    processor = SignalProcessor(model="beats")
+    load_calls: list[str] = []
+
+    def load_beats(checkpoint_path: str) -> None:
+        load_calls.append(checkpoint_path)
+        processor._beats_model = object()
+        processor.checkpoint_sha256 = "test-sha256"
+
+    monkeypatch.setattr(processor, "_load_beats", load_beats)
+
+    assert processor.prepare() == "test-sha256"
+    assert processor.prepare() == "test-sha256"
+    assert load_calls == [str(processor.checkpoint_path)]
+
+
+def test_beats_checkpoint_sidecar_is_enforced(tmp_path) -> None:
+    checkpoint = tmp_path / "beats.pt"
+    checkpoint.write_bytes(b"trusted-beats")
+    processor = SignalProcessor(model="beats", checkpoint_path=checkpoint)
+
+    with pytest.raises(FileNotFoundError, match="sidecar"):
+        processor.validate_beats_checkpoint()
+
+    checkpoint.with_suffix(".sha256").write_text("")
+    with pytest.raises(ValueError, match="invalid"):
+        processor.validate_beats_checkpoint()
+
+    digest = processor._sha256_file(checkpoint)
+    checkpoint.with_suffix(".sha256").write_text(f"{digest}  beats.pt\n")
+    assert processor.validate_beats_checkpoint() == digest
+
+
+def test_beats_rejects_malformed_checkpoint(tmp_path) -> None:
+    import torch
+
+    checkpoint = tmp_path / "beats.pt"
+    torch.save({"unexpected": {}}, checkpoint)
+    processor = SignalProcessor(
+        model="beats",
+        checkpoint_path=checkpoint,
+        verify_checkpoint=False,
+    )
+
+    with pytest.raises(ValueError, match="must contain 'cfg' and 'model'"):
+        processor.prepare()
+
+
+def test_beats_extracts_deterministic_mean_pooled_embedding(monkeypatch) -> None:
+    import torch
+
+    class FakeBEATs:
+        def __init__(self) -> None:
+            self.patch_embedding = torch.nn.Conv2d(1, BEATS_EMBEDDING_DIM, 1, bias=False)
+            torch.nn.init.constant_(self.patch_embedding.weight, 0.5)
+            self.layer_norm = torch.nn.Identity()
+            self.post_extract_proj = None
+            self.dropout_input = torch.nn.Identity()
+
+        @staticmethod
+        def preprocess(waveform):
+            return waveform[:, :16].reshape(1, 4, 4)
+
+        @staticmethod
+        def encoder(features):
+            return features, []
+
+    processor = SignalProcessor(model="beats")
+
+    def load_beats(_checkpoint_path: str) -> None:
+        processor._beats_model = FakeBEATs()
+        processor._beats_device = torch.device("cpu")
+
+    monkeypatch.setattr(processor, "_load_beats", load_beats)
+    waveform = np.linspace(-1.0, 1.0, 16000, dtype=np.float32)
+
+    first = processor.extract_features(waveform)
+    second = processor.extract_features(waveform)
+
+    assert first.shape == (BEATS_EMBEDDING_DIM,)
+    assert np.isfinite(first).all()
+    np.testing.assert_array_equal(first, second)

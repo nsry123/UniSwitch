@@ -2,9 +2,9 @@
 
 Universal Switch is a local prototype that learns user-defined labels for the
 surface or location of acoustic knocks, such as `desk` or `wall`. It also counts
-threshold-qualified knocks within each captured window. A pretrained PANN CNN14
-network creates audio embeddings; an in-memory or persisted scikit-learn KNN
-model learns the user's labels. No cloud service is involved.
+threshold-qualified knocks within each captured window. By default, a frozen
+Microsoft BEATs Iter3+ AS2M encoder creates 768-D audio embeddings and the local
+prototype/exemplar classifier learns the user's labels. No cloud service is involved.
 
 The switch/action bridge is not implemented. A successful classification
 currently prints an action message to the terminal.
@@ -29,18 +29,33 @@ conda env update -n univ-switch -f environment.yml --prune
 adds test, lint, and type-check tools. On systems where PyAudio is installed by
 pip, PortAudio development headers must already be available.
 
-## PANN checkpoint
+## BEATs checkpoint
 
-The default application requires the official PANN CNN14 checkpoint. It is not
-committed because it is approximately 312 MB.
+The default application requires the official pretraining-only
+`BEATs_iter3+ (AS2M)` checkpoint from the
+[Microsoft BEATs release](https://github.com/microsoft/unilm/tree/master/beats).
+The model is not committed and is never downloaded automatically. Obtain the
+official file and its SHA-256 digest through a trusted channel, then install it:
+
+```bash
+conda run -n univ-switch python scripts/install_beats.py \
+  /path/to/official/BEATs_iter3_plus_AS2M.pt \
+  --sha256 <trusted-64-character-digest>
+```
+
+The installer verifies the source before atomically writing
+`models/BEATs_iter3_plus_AS2M.pt` and its `.sha256` sidecar. Runtime verification
+uses that sidecar and strict checkpoint loading. The vendored encoder source is
+pinned to Microsoft UNILM revision
+`833df7e7832e5064a281131ee64a481afa8e5b95`.
+
+PANN remains available as an alternative. Its official checkpoint downloader is
+unchanged:
 
 ```bash
 conda run -n univ-switch python scripts/download_pann.py
+conda run -n univ-switch python main.py --model pann --device-index 0
 ```
-
-The downloader writes `models/Cnn14_mAP=0.431.pth` only after verifying SHA-256
-`0dc499e40e9761ef5ea061ffc77697697f277f6a960894903df3ada000e34b31`.
-It never runs automatically. You can instead place a trusted copy at that path.
 
 ## Run and register labels
 
@@ -66,12 +81,15 @@ which prevents table ringing and threshold chatter from inflating the count.
 
 At the prompt, enter `register desk`. Each threshold-triggered capture window is
 one registration example, even if energy detection finds multiple knocks inside
-that window. Registrations are saved to `state/registrations.npz` by default and
-loaded on the next startup. Enter `delete desk` to remove that class and all of
+that window. BEATs registrations are saved to
+`state/beats-registrations.npz` by default and loaded on the next startup. Enter
+`delete desk` to remove that class and all of
 its examples; deleting the final class also removes the empty state file. Enter
 `list` to show every registered label and its example count. Enter `quit` or
 press Ctrl-C for a graceful shutdown.
-PANN embeddings use L2 normalization and cosine distance. Each class becomes
+Mean-pooled BEATs embeddings use L2 normalization and cosine distance with a
+provisional global ceiling of `0.15`; prefer the offline evaluator's calibrated
+value when representative validation data is available. Each class becomes
 eligible after three examples and is represented by its prototype, registered
 exemplars, and leave-one-out spread. A prediction must pass both its
 class-specific distance radius and the margin from the runner-up class. Known
@@ -85,6 +103,13 @@ available through `--prototype-weight`, `--spread-multiplier`,
 `--margin-threshold`, and `--probability-temperature`. Persisted state files keep
 their scoring configuration. Schema-v2 registrations are upgraded in memory and
 written as schema v3 on the next save.
+
+Each feature extractor has an independent default state file, so switching
+models never silently reuses incompatible registrations:
+
+- BEATs: `state/beats-registrations.npz`
+- PANN: `state/registrations.npz`
+- Legacy: `state/legacy-registrations.npz`
 
 For the faster 30-value legacy feature extractor:
 
@@ -102,7 +127,6 @@ group; a group may occur in only one split.
 ```bash
 conda run -n univ-switch python -m scripts.evaluate \
   --manifest datasets/manifest.csv \
-  --model legacy \
   --save-model outputs/evaluated_classifier.npz
 ```
 
@@ -123,14 +147,17 @@ conda run -n univ-switch python -m ruff check .
 conda run -n univ-switch python -m mypy main.py src scripts
 ```
 
-The PANN integration test is skipped when the checkpoint is absent. Tests never
-download models, use a microphone, or call external services.
+The BEATs and PANN integration tests skip when their optional checkpoints are
+absent. Tests never download models, use a microphone, or call external services.
 
 ## Troubleshooting
 
 - **No input device:** run with `--list-devices`, then pass the desired index.
-- **Checkpoint error:** run `scripts/download_pann.py` or pass
-  `--checkpoint /trusted/path/checkpoint.pth`.
+- **BEATs checkpoint error:** install the official pretraining checkpoint and
+  trusted digest with `scripts/install_beats.py`. Do not use an AudioSet
+  fine-tuned checkpoint.
+- **PANN checkpoint error:** run `scripts/download_pann.py` and select
+  `--model pann`, or pass `--checkpoint /trusted/path/checkpoint.pth`.
 - **M4A cannot be decoded:** install FFmpeg or recreate the Conda environment.
 - **Numba cache is unwritable:** set `NUMBA_CACHE_DIR` to a writable cache path.
 - **Worker stopped:** the CLI prints the processing exception and stops capture;
@@ -139,3 +166,5 @@ download models, use a microphone, or call external services.
   `--monitor-port 9000`.
 - **Schema-v1 PANN registration error:** re-register using a new `--state-path`
   or move/remove the old state file. Legacy registration files remain compatible.
+- **Existing PANN registrations:** start with `--model pann`; BEATs cannot reuse
+  embeddings created by another encoder.
