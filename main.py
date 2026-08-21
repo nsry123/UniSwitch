@@ -41,6 +41,10 @@ def load_or_create_classifier(
     n_neighbors: int,
     distance_threshold: float,
     distance_mode: DistanceMode,
+    prototype_weight: float,
+    spread_multiplier: float,
+    margin_threshold: float | None,
+    probability_temperature: float | None,
 ) -> TapClassifier:
     """Load compatible registrations or return a new classifier."""
     if state_path is None or not state_path.exists():
@@ -48,6 +52,10 @@ def load_or_create_classifier(
             n_neighbors=n_neighbors,
             distance_threshold=distance_threshold,
             distance_mode=distance_mode,
+            prototype_weight=prototype_weight,
+            spread_multiplier=spread_multiplier,
+            margin_threshold=margin_threshold,
+            probability_temperature=probability_temperature,
         )
 
     classifier = TapClassifier.load(state_path)
@@ -97,17 +105,37 @@ def run_application(arguments: argparse.Namespace) -> int:
         n_neighbors=arguments.neighbors,
         distance_threshold=threshold,
         distance_mode=distance_mode,
+        prototype_weight=arguments.prototype_weight,
+        spread_multiplier=arguments.spread_multiplier,
+        margin_threshold=arguments.margin_threshold,
+        probability_temperature=arguments.probability_temperature,
     )
     print(
         f"[*] Classifier distance: {classifier.distance_mode} "
         f"(rejection threshold: {classifier.distance_threshold:g})"
+    )
+    print(
+        f"[*] Prototype scoring: weight={classifier.prototype_weight:g} "
+        f"spread={classifier.spread_multiplier:g} "
+        f"margin={classifier.margin_threshold:g} "
+        f"temperature={classifier.probability_temperature:g}"
     )
     metadata = {
         "feature_extractor": arguments.model,
         "checkpoint_sha256": checkpoint_sha256,
         "sample_rate": processor.sample_rate,
     }
-    controller = SwitchController(classifier, state_path=state_path, state_metadata=metadata)
+    controller = SwitchController(
+        classifier,
+        state_path=state_path,
+        state_metadata=metadata,
+        confirmation_count=arguments.confirmation_count,
+        event_cooldown=arguments.event_cooldown,
+    )
+    print(
+        f"[*] Event confirmation: {arguments.confirmation_count} matching capture(s), "
+        f"{arguments.event_cooldown:g}s cooldown"
+    )
     monitor = None
     if not arguments.no_monitor:
         monitor = MicrophoneMonitor(
@@ -187,6 +215,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-state", action="store_true")
     parser.add_argument("--neighbors", type=int, default=3)
     parser.add_argument("--distance-threshold", type=float)
+    parser.add_argument("--prototype-weight", type=float, default=0.5)
+    parser.add_argument("--spread-multiplier", type=float, default=2.0)
+    parser.add_argument("--margin-threshold", type=float)
+    parser.add_argument("--probability-temperature", type=float)
+    parser.add_argument("--confirmation-count", type=int, default=1)
+    parser.add_argument("--event-cooldown", type=float, default=2.0)
     parser.add_argument("--energy-threshold", type=float, default=0.015)
     parser.add_argument("--registration-samples", type=int, default=10)
     parser.add_argument("--monitor-port", type=int, default=8765)

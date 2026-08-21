@@ -68,9 +68,20 @@ At the prompt, enter `register desk`. Each threshold-triggered capture window is
 one registration example, even if energy detection finds multiple knocks inside
 that window. Registrations are saved to `state/registrations.npz` by default and
 loaded on the next startup. Enter `quit` or press Ctrl-C for a graceful shutdown.
-PANN embeddings use L2 normalization and cosine distance with a provisional
-default rejection threshold of `0.20`; the active metric and threshold are
-printed at startup.
+PANN embeddings use L2 normalization and cosine distance. Each class becomes
+eligible after three examples and is represented by its prototype, registered
+exemplars, and leave-one-out spread. A prediction must pass both its
+class-specific distance radius and the margin from the runner-up class. Known
+class probabilities are derived from the blended prototype/exemplar scores.
+
+An accepted capture triggers its action immediately. After an event, matching
+captures are suppressed for two seconds. Rejected captures clear pending
+evidence. Optional multi-capture confirmation is available through
+`--confirmation-count`; tune cooldown with `--event-cooldown`. Scoring controls are
+available through `--prototype-weight`, `--spread-multiplier`,
+`--margin-threshold`, and `--probability-temperature`. Persisted state files keep
+their scoring configuration. Schema-v2 registrations are upgraded in memory and
+written as schema v3 on the next save.
 
 For the faster 30-value legacy feature extractor:
 
@@ -92,11 +103,13 @@ conda run -n univ-switch python -m scripts.evaluate \
   --save-model outputs/evaluated_classifier.npz
 ```
 
-The evaluator calibrates K and the unknown-rejection distance on the validation
-split, then reports known-label classification and unknown-rejection metrics on
-the test split. A label absent from the training split is treated as unknown.
-These metrics describe only the supplied manifest; the repository does not ship
-a dataset or claim model quality.
+The evaluator calibrates exemplar count, rejection distance, prototype weight,
+spread multiplier, ambiguity margin, and probability temperature on the
+validation split. It then reports known-label classification, unknown rejection,
+and known-class probability negative log-likelihood on the test split. A label
+absent from the training split is treated as unknown. These metrics describe only
+the supplied manifest; the repository does not ship a dataset or claim model
+quality.
 
 ## Development checks
 

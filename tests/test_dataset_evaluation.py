@@ -84,9 +84,16 @@ def test_calibration_and_evaluation_separate_unknown_rejection() -> None:
 
 def test_cosine_calibration_matches_runtime_distance_mode() -> None:
     train_x = np.array(
-        [[1.0, 0.0], [1.0, 0.01], [0.0, 1.0], [0.01, 1.0]]
+        [
+            [1.0, 0.0],
+            [1.0, 0.01],
+            [1.0, -0.01],
+            [0.0, 1.0],
+            [0.01, 1.0],
+            [-0.01, 1.0],
+        ]
     )
-    train_y = np.array(["desk", "desk", "wall", "wall"])
+    train_y = np.array(["desk", "desk", "desk", "wall", "wall", "wall"])
     validation_x = np.array([[10.0, 0.0], [0.0, 10.0], [-1.0, 0.0]])
     validation_y = np.array(["desk", "wall", "unknown-surface"])
 
@@ -105,3 +112,13 @@ def test_cosine_calibration_matches_runtime_distance_mode() -> None:
     assert calibration.unknown_rejection_rate == 1.0
     assert report.known_end_to_end_accuracy == 1.0
     assert report.unknown_rejection_rate == 1.0
+
+
+def test_calibration_requires_three_examples_per_class() -> None:
+    with pytest.raises(ValueError, match="at least three"):
+        calibrate_classifier(
+            np.array([[0.0, 0.0], [0.1, 0.0]]),
+            np.array(["desk", "desk"]),
+            np.array([[0.05, 0.0]]),
+            np.array(["desk"]),
+        )
