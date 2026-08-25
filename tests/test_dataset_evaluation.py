@@ -4,7 +4,11 @@ import numpy as np
 import pytest
 
 from src.ml.dataset import REQUIRED_COLUMNS, load_manifest
-from src.ml.evaluation import calibrate_classifier, evaluate_classifier
+from src.ml.evaluation import (
+    calibrate_classifier,
+    calibrate_grouped_classifier,
+    evaluate_classifier,
+)
 
 
 def write_manifest(path, rows) -> None:
@@ -122,3 +126,39 @@ def test_calibration_requires_three_examples_per_class() -> None:
             np.array([[0.05, 0.0]]),
             np.array(["desk"]),
         )
+
+
+def test_grouped_calibration_uses_physical_captures_and_unknowns() -> None:
+    features = []
+    labels = []
+    capture_ids = []
+    augmented = []
+    for label, center, first_id in (("desk", 0.0, 0), ("wall", 1.0, 4)):
+        for offset in range(4):
+            capture_id = first_id + offset
+            vector = np.array([1.0 - center, center + offset * 0.002])
+            for scale, is_augmented in ((1.0, False), (0.8, True)):
+                features.append(vector * scale)
+                labels.append(label)
+                capture_ids.append(capture_id)
+                augmented.append(is_augmented)
+    negatives = np.tile(np.array([[-1.0, 0.0]]), (10, 1))
+
+    classifier, result = calibrate_grouped_classifier(
+        np.asarray(features),
+        np.asarray(labels),
+        np.asarray(capture_ids),
+        np.asarray(augmented),
+        negatives,
+        distance_mode="cosine",
+        neighbor_candidates=(1,),
+        prototype_weight_candidates=(0.5,),
+        spread_multiplier_candidates=(2.0,),
+        margin_ratio_candidates=(0.1,),
+        temperature_ratio_candidates=(0.5,),
+    )
+
+    assert classifier.class_capture_counts() == {"desk": 4, "wall": 4}
+    assert result.fold_count == 4
+    assert result.known_end_to_end_accuracy >= 0.75
+    assert result.unknown_rejection_rate == 1.0

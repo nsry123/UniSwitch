@@ -15,6 +15,16 @@ const resultCandidate = document.querySelector("#result-candidate");
 const resultConfidence = document.querySelector("#result-confidence");
 const resultDistance = document.querySelector("#result-distance");
 const resultMargin = document.querySelector("#result-margin");
+const calibrationPanel = document.querySelector("#calibration-panel");
+const calibrationState = document.querySelector("#calibration-state");
+const calibrationTitle = document.querySelector("#calibration-title");
+const calibrationMessage = document.querySelector("#calibration-message");
+const calibrationProgress = document.querySelector("#calibration-progress");
+const calibrationClasses = document.querySelector("#calibration-classes");
+const calibrationUnknowns = document.querySelector("#calibration-unknowns");
+const calibrationKnown = document.querySelector("#calibration-known");
+const calibrationRejection = document.querySelector("#calibration-rejection");
+const calibrationParameters = document.querySelector("#calibration-parameters");
 
 const history = [];
 const maxPoints = 240;
@@ -50,6 +60,33 @@ function renderResult(result) {
     result.margin == null
       ? result.accepted == null ? "—" : "Single class"
       : `${result.margin.toFixed(3)} / ${result.requiredMargin.toFixed(3)} required`;
+}
+
+function renderCalibration(calibration) {
+  if (!calibration) return;
+  const state = calibration.state || "needs_data";
+  calibrationPanel.className = `panel calibration-panel ${state}`;
+  calibrationState.className = `result-badge ${state === "failed" ? "unknown" : state === "passed" || state === "ready" ? "accepted" : "registration"}`;
+  calibrationState.textContent = state.replace("_", " ");
+  calibrationTitle.textContent = state === "passed" ? "Classifier calibrated" : "Classifier setup";
+  calibrationMessage.textContent = calibration.message || "—";
+  const done = calibration.evaluatedCandidates || 0;
+  const total = calibration.totalCandidates || 0;
+  calibrationProgress.textContent = state === "running" && total
+    ? `Evaluated ${done.toLocaleString()} of ${total.toLocaleString()} candidates`
+    : "";
+  const counts = Object.entries(calibration.classCaptureCounts || {});
+  calibrationClasses.textContent = counts.length
+    ? counts.map(([label, count]) => `${label}: ${count}`).join(", ")
+    : "—";
+  calibrationUnknowns.textContent = `${calibration.unknownCaptureCount || 0} / 10`;
+  const metrics = calibration.metrics;
+  calibrationKnown.textContent = metrics ? `${(metrics.knownAccuracy * 100).toFixed(1)}%` : "—";
+  calibrationRejection.textContent = metrics ? `${(metrics.unknownRejection * 100).toFixed(1)}%` : "—";
+  const parameters = calibration.parameters;
+  calibrationParameters.textContent = parameters
+    ? `k=${parameters.n_neighbors}, distance=${parameters.distance_threshold.toFixed(4)}, prototype=${parameters.prototype_weight.toFixed(2)}, spread=${parameters.spread_multiplier.toFixed(2)}, margin=${parameters.margin_threshold.toFixed(4)}, temperature=${parameters.probability_temperature.toFixed(4)}`
+    : "—";
 }
 
 function fitCanvas(canvas) {
@@ -169,6 +206,7 @@ async function poll() {
       renderResult(state.lastResult);
       lastResultSequence = state.resultSequence;
     }
+    renderCalibration(state.calibration);
     energyValue.textContent = state.energy.toFixed(4);
     thresholdValue.textContent = state.threshold.toFixed(4);
     thresholdLegend.textContent = state.threshold.toFixed(4);

@@ -55,6 +55,27 @@
         </dl>
       </section>
 
+      <section class="panel calibration-panel needs_data" id="calibration-panel" aria-live="polite">
+        <div class="calibration-copy">
+          <div class="result-heading">
+            <p class="eyebrow">Interactive calibration</p>
+            <span class="result-badge waiting" id="calibration-state">Needs data</span>
+          </div>
+          <h2 id="calibration-title">Classifier setup</h2>
+          <p class="result-reason" id="calibration-message">
+            Register class captures to begin calibration.
+          </p>
+          <p class="calibration-progress" id="calibration-progress"></p>
+        </div>
+        <dl class="result-details" aria-label="Calibration status and measurements">
+          <div><dt>Class captures</dt><dd id="calibration-classes">—</dd></div>
+          <div><dt>Unknown captures</dt><dd id="calibration-unknowns">0 / 10</dd></div>
+          <div><dt>Known accuracy</dt><dd id="calibration-known">—</dd></div>
+          <div><dt>Unknown rejection</dt><dd id="calibration-rejection">—</dd></div>
+          <div class="calibration-parameters"><dt>Selected parameters</dt><dd id="calibration-parameters">—</dd></div>
+        </dl>
+      </section>
+
       <section class="panel energy-panel">
         <div class="panel-heading">
           <div>

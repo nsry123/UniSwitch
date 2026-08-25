@@ -10,6 +10,12 @@ from pathlib import Path
 import librosa
 import numpy as np
 
+from src.audio.augmentation import (
+    DEFAULT_GAIN_DB,
+    apply_gain_db,
+    validate_gain_db,
+    validate_gain_values,
+)
 from src.audio.processor import (
     BEATS_CHECKPOINT_PATH,
     BEATS_EMBEDDING_DIM,
@@ -26,6 +32,7 @@ def extract_split(
     records: list[AudioRecord],
     split: str,
     processor: SignalProcessor,
+    gain_db_values: tuple[float, ...] = (),
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract deterministic features for one manifest split."""
     vectors: list[np.ndarray] = []
@@ -50,7 +57,26 @@ def extract_split(
             raise ValueError(f"audio is empty after trimming: {record.path}")
         vectors.append(processor.extract_features(trimmed))
         labels.append(record.label)
+        for gain_db in gain_db_values:
+            vectors.append(processor.extract_features(apply_gain_db(trimmed, gain_db)))
+            labels.append(record.label)
     return np.vstack(vectors), np.asarray(labels, dtype=np.str_)
+
+
+def gain_db_argument(value: str) -> float:
+    """Parse one CLI gain value with an argparse-compatible error."""
+    try:
+        return validate_gain_db(float(value))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def resolve_gain_db(arguments: argparse.Namespace) -> tuple[float, ...]:
+    """Resolve default, custom, or disabled gain augmentation settings."""
+    if arguments.no_gain_augmentation:
+        return ()
+    requested = arguments.gain_db
+    return validate_gain_values(DEFAULT_GAIN_DB if requested is None else requested)
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +87,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-checkpoint-verification", action="store_true")
     parser.add_argument("--neighbors", type=int, nargs="+", default=[1, 3, 5, 7])
     parser.add_argument("--save-model", type=Path)
+    gain_group = parser.add_mutually_exclusive_group()
+    gain_group.add_argument(
+        "--gain-db",
+        action="append",
+        type=gain_db_argument,
+        help="gain in dB to add as a training variant; repeat for multiple values",
+    )
+    gain_group.add_argument("--no-gain-augmentation", action="store_true")
     return parser.parse_args()
 
 
@@ -81,7 +115,13 @@ def main(arguments: argparse.Namespace) -> int:
     if arguments.model in {"beats", "pann"}:
         checkpoint_sha256 = processor.prepare()
 
-    train_features, train_labels = extract_split(records, "train", processor)
+    gain_db_values = resolve_gain_db(arguments)
+    train_features, train_labels = extract_split(
+        records,
+        "train",
+        processor,
+        gain_db_values,
+    )
     validation_features, validation_labels = extract_split(records, "validation", processor)
     test_features, test_labels = extract_split(records, "test", processor)
     classifier, calibration = calibrate_classifier(
@@ -106,6 +146,10 @@ def main(arguments: argparse.Namespace) -> int:
             "sample_rate": processor.sample_rate,
             "dataset_manifest_sha256": manifest_digest,
             "calibration": calibration.__dict__,
+            "gain_augmentation": {
+                "gain_db": list(gain_db_values),
+                "peak_safe": True,
+            },
         }
         if arguments.model == "beats":
             metadata.update(

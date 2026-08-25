@@ -32,6 +32,39 @@ def test_classifier_state_round_trip(tmp_path) -> None:
     assert restored.distance_mode == "standardized_euclidean"
 
 
+def test_physical_capture_ids_control_eligibility_and_round_trip(tmp_path) -> None:
+    classifier = TapClassifier(n_neighbors=1, distance_threshold=2.5)
+    for capture_id in range(3):
+        classifier.register_tap(
+            np.array([1.0, 2.0 + capture_id * 0.01]),
+            "desk",
+            capture_id=capture_id,
+        )
+        classifier.register_tap(
+            np.array([1.0, 2.0 + capture_id * 0.01]) * 0.5,
+            "desk",
+            announce=False,
+            capture_id=capture_id,
+            augmented=True,
+        )
+        if capture_id < 2:
+            assert not classifier.is_trained
+
+    classifier.register_unknown(np.array([20.0, 30.0]), capture_id=3)
+    classifier.calibration_report = {"status": "passed", "state": "passed"}
+    path = tmp_path / "schema-v4.npz"
+    classifier.save(path)
+    restored = TapClassifier.load(path)
+
+    assert restored.is_trained
+    assert restored.class_capture_counts() == {"desk": 3}
+    assert restored.class_counts() == {"desk": 6}
+    assert restored.capture_ids == [0, 0, 1, 1, 2, 2]
+    assert restored.augmented_flags == [False, True] * 3
+    assert len(restored.negative_data) == 1
+    assert restored.calibration_report == {"state": "passed", "status": "passed"}
+
+
 def test_classifier_rejects_bad_features() -> None:
     classifier = TapClassifier()
     with pytest.raises(ValueError, match="one-dimensional"):
@@ -105,9 +138,7 @@ def test_cosine_classifier_state_round_trip(tmp_path) -> None:
     assert restored.margin_threshold == pytest.approx(0.02)
     assert restored.probability_temperature == pytest.approx(0.1)
     assert restored.predict(np.array([2.0, 4.0, 6.0])) == "desk"
-    assert restored._nearest_distance(np.array([2.0, 4.0, 6.0])) == pytest.approx(
-        0.0, abs=1e-12
-    )
+    assert restored._nearest_distance(np.array([2.0, 4.0, 6.0])) == pytest.approx(0.0, abs=1e-12)
 
 
 def write_schema_v1_state(path, feature_extractor: str) -> None:
@@ -126,15 +157,12 @@ def write_schema_v1_state(path, feature_extractor: str) -> None:
     )
 
 
-def test_schema_v1_legacy_state_remains_compatible(tmp_path) -> None:
+def test_schema_v1_legacy_state_requires_reregistration(tmp_path) -> None:
     path = tmp_path / "legacy-v1.npz"
     write_schema_v1_state(path, "legacy")
 
-    restored = TapClassifier.load(path)
-
-    assert restored.distance_mode == "standardized_euclidean"
-    assert restored.predict(np.array([1.0, 2.0, 3.0])) == "Unknown"
-    assert not restored.is_trained
+    with pytest.raises(ValueError, match="re-register using a new --state-path"):
+        TapClassifier.load(path)
 
 
 def test_schema_v1_pann_state_requires_reregistration(tmp_path) -> None:
@@ -189,9 +217,8 @@ def test_ambiguous_query_is_rejected_by_margin() -> None:
     assert result.rejection_reason == "margin"
 
 
-def test_schema_v2_is_upgraded_on_next_save(tmp_path) -> None:
+def test_schema_v2_requires_reregistration(tmp_path) -> None:
     old_path = tmp_path / "schema-v2.npz"
-    new_path = tmp_path / "schema-v3.npz"
     manifest = {
         "schema_version": 2,
         "n_neighbors": 1,
@@ -207,13 +234,29 @@ def test_schema_v2_is_upgraded_on_next_save(tmp_path) -> None:
         manifest=np.asarray(json.dumps(manifest)),
     )
 
-    classifier = TapClassifier.load(old_path)
-    classifier.save(new_path)
+    with pytest.raises(ValueError, match="re-register using a new --state-path"):
+        TapClassifier.load(old_path)
 
-    with np.load(new_path, allow_pickle=False) as persisted:
-        upgraded = json.loads(str(persisted["manifest"].item()))
-    assert upgraded["schema_version"] == 3
-    assert upgraded["prototype_weight"] == 0.5
+
+def test_schema_v3_requires_reregistration(tmp_path) -> None:
+    path = tmp_path / "schema-v3.npz"
+    manifest = {
+        "schema_version": 3,
+        "n_neighbors": 1,
+        "distance_threshold": 0.2,
+        "distance_mode": "cosine",
+        "feature_dim": 2,
+        "metadata": {"feature_extractor": "beats"},
+    }
+    np.savez_compressed(
+        path,
+        features=np.array([[1.0, 0.0]]),
+        labels=np.array(["desk"]),
+        manifest=np.asarray(json.dumps(manifest)),
+    )
+
+    with pytest.raises(ValueError, match="re-register using a new --state-path"):
+        TapClassifier.load(path)
 
 
 def test_delete_class_removes_examples_and_rebuilds_statistics() -> None:

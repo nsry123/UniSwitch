@@ -64,6 +64,75 @@ def test_worker_delivers_processed_capture_without_microphone() -> None:
     assert listener.processor.count_thresholds == [0.123]
 
 
+def test_worker_augments_only_when_requested() -> None:
+    processor = StubProcessor()
+    listener = worker_only_listener(processor)
+    received: list[tuple[np.ndarray, int, tuple[np.ndarray, ...]]] = []
+    callback_event = threading.Event()
+
+    def augmented_callback(
+        features: np.ndarray,
+        tap_count: int,
+        augmented_features: tuple[np.ndarray, ...],
+    ) -> None:
+        received.append((features, tap_count, augmented_features))
+        callback_event.set()
+
+    worker = threading.Thread(
+        target=listener._worker_loop,
+        args=(
+            lambda _features, _count: None,
+            None,
+            augmented_callback,
+            lambda: True,
+            (-6.0, 6.0),
+        ),
+    )
+    worker.start()
+    waveform = np.array([0.5, 0.0, 0.0, 0.0, 0.25, 0.0], dtype=np.float32)
+    listener._capture_queue.put(CapturedAudio(waveform, trigger_sample=3))
+    assert callback_event.wait(timeout=2.0)
+    listener.stop()
+    worker.join(timeout=2.0)
+
+    original, tap_count, variants = received[0]
+    np.testing.assert_allclose(original, [0.125, 0.5])
+    assert tap_count == 1
+    assert len(variants) == 2
+    np.testing.assert_allclose(
+        variants[0],
+        np.array([0.125, 0.5], dtype=np.float32) * (10.0 ** (-6.0 / 20.0)),
+    )
+    np.testing.assert_allclose(
+        variants[1],
+        np.array([0.125, 0.5], dtype=np.float32) * (10.0 ** (6.0 / 20.0)),
+    )
+    assert processor.count_thresholds == [0.123]
+
+
+def test_worker_skips_augmented_extraction_in_execute_mode() -> None:
+    processor = StubProcessor()
+    listener = worker_only_listener(processor)
+    callback_event = threading.Event()
+    received: list[np.ndarray] = []
+
+    def callback(features: np.ndarray, _tap_count: int) -> None:
+        received.append(features)
+        callback_event.set()
+
+    worker = threading.Thread(
+        target=listener._worker_loop,
+        args=(callback, None, lambda *_args: None, lambda: False, (-9.0, 6.0)),
+    )
+    worker.start()
+    listener._capture_queue.put(CapturedAudio(np.ones(4, dtype=np.float32), 0))
+    assert callback_event.wait(timeout=2.0)
+    listener.stop()
+    worker.join(timeout=2.0)
+
+    assert len(received) == 1
+
+
 def test_worker_surfaces_processing_failure() -> None:
     listener = worker_only_listener(FailingProcessor())
     errors: list[Exception] = []

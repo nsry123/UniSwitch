@@ -5,9 +5,11 @@ import pytest
 
 from main import (
     DEFAULT_DISTANCE_THRESHOLDS,
+    DEFAULT_GAIN_DB,
     load_or_create_classifier,
     parse_args,
     resolve_checkpoint_path,
+    resolve_gain_db,
     resolve_state_path,
 )
 from scripts.evaluate import parse_args as parse_evaluate_args
@@ -24,6 +26,17 @@ def test_beats_is_cli_default(monkeypatch) -> None:
     assert arguments.checkpoint is None
     assert arguments.state_path is None
     assert DEFAULT_DISTANCE_THRESHOLDS["beats"] == 0.15
+    assert resolve_gain_db(arguments) == DEFAULT_GAIN_DB
+
+
+def test_gain_cli_accepts_custom_values_and_disable(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["main.py", "--gain-db", "-3", "--gain-db", "4"])
+    custom = parse_args()
+    assert resolve_gain_db(custom) == (-3.0, 4.0)
+
+    monkeypatch.setattr(sys, "argv", ["main.py", "--no-gain-augmentation"])
+    disabled = parse_args()
+    assert resolve_gain_db(disabled) == ()
 
 
 def test_model_specific_checkpoint_and_state_paths() -> None:
@@ -82,10 +95,14 @@ def test_pann_state_remains_available_only_for_pann(tmp_path) -> None:
     }
     classifier.save(state_path, pann_metadata)
 
+    current_metadata = {
+        **pann_metadata,
+        "gain_augmentation": {"gain_db": [-9.0, 6.0], "peak_safe": True},
+    }
     restored = load_or_create_classifier(
         state_path,
         "pann",
-        pann_metadata,
+        current_metadata,
         1,
         0.2,
         "cosine",

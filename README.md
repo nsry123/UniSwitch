@@ -81,17 +81,22 @@ which prevents table ringing and threshold chatter from inflating the count.
 
 At the prompt, enter `register desk`. Each threshold-triggered capture window is
 one registration example, even if energy detection finds multiple knocks inside
-that window. BEATs registrations are saved to
+that window. By default, registration retains the original waveform and adds
+peak-safe `-9 dB` and `+6 dB` variants before feature extraction, so one physical
+capture stores three classifier exemplars while advancing registration progress
+once. Repeat `--gain-db VALUE` to select different gains, or use
+`--no-gain-augmentation` to retain only originals. Gain augmentation never runs
+during live inference or tap counting. BEATs registrations are saved to
 `state/beats-registrations.npz` by default and loaded on the next startup. Enter
 `delete desk` to remove that class and all of
 its examples; deleting the final class also removes the empty state file. Enter
-`list` to show every registered label and its example count. Enter `quit` or
-press Ctrl-C for a graceful shutdown.
+`list` to show every registered label's physical-capture and exemplar counts.
+Enter `quit` or press Ctrl-C for a graceful shutdown.
 Mean-pooled BEATs embeddings use L2 normalization and cosine distance with a
 provisional global ceiling of `0.15`; prefer the offline evaluator's calibrated
 value when representative validation data is available. Each class becomes
-eligible after three examples and is represented by its prototype, registered
-exemplars, and leave-one-out spread. A prediction must pass both its
+eligible after three independent physical captures and is represented by its
+prototype, registered exemplars, and leave-one-out spread. A prediction must pass both its
 class-specific distance radius and the margin from the runner-up class. Known
 class probabilities are derived from the blended prototype/exemplar scores.
 
@@ -101,8 +106,35 @@ evidence. Optional multi-capture confirmation is available through
 `--confirmation-count`; tune cooldown with `--event-cooldown`. Scoring controls are
 available through `--prototype-weight`, `--spread-multiplier`,
 `--margin-threshold`, and `--probability-temperature`. Persisted state files keep
-their scoring configuration. Schema-v2 registrations are upgraded in memory and
-written as schema v3 on the next save.
+their scoring configuration.
+
+### Interactive calibration
+
+After registering each intended class with at least four physical captures,
+collect ordinary non-command sounds and run calibration:
+
+```text
+>> register desk
+>> register wall
+>> collect-unknown
+>> calibrate
+```
+
+`collect-unknown` stores ten unaugmented captures by default; pass another count
+as `collect-unknown 15`. Use `cancel` to stop an active collection and
+`clear-unknown` to discard its negative examples. Calibration keeps augmented
+variants grouped with their physical capture, searches classifier parameters
+with up to five validation folds, and applies the result only when held-out
+known accuracy and unknown rejection both reach 80%. Otherwise, the current
+parameters remain active and the terminal and web monitor explain what failed.
+The monitor is read-only and shows capture counts, readiness, progress, metrics,
+and the selected parameters.
+
+State schema v4 stores physical capture identity and unknown calibration data.
+Older schema-v1 through schema-v3 state files are intentionally rejected because
+they cannot guarantee safe grouping of augmented variants. Select a new
+`--state-path` or move the old file and re-register; old files are never deleted
+automatically.
 
 Each feature extractor has an independent default state file, so switching
 models never silently reuses incompatible registrations:
@@ -136,7 +168,10 @@ validation split. It then reports known-label classification, unknown rejection,
 and known-class probability negative log-likelihood on the test split. A label
 absent from the training split is treated as unknown. These metrics describe only
 the supplied manifest; the repository does not ship a dataset or claim model
-quality.
+quality. The evaluator applies the same default `-9 dB` and peak-safe `+6 dB`
+variants only to training recordings; validation and test recordings remain
+unaltered. Use repeated `--gain-db VALUE` options to customize the recipe or
+`--no-gain-augmentation` to disable it.
 
 ## Development checks
 
@@ -164,7 +199,7 @@ absent. Tests never download models, use a microphone, or call external services
   fix the reported model/audio error before restarting.
 - **Monitor port is already in use:** pass another value such as
   `--monitor-port 9000`.
-- **Schema-v1 PANN registration error:** re-register using a new `--state-path`
-  or move/remove the old state file. Legacy registration files remain compatible.
+- **Schema-v1–v3 registration error:** re-register using a new `--state-path`
+  or move/remove the old state file. Old files are left unchanged.
 - **Existing PANN registrations:** start with `--model pann`; BEATs cannot reuse
   embeddings created by another encoder.

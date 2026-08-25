@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pyaudio
 
+from src.audio.augmentation import DEFAULT_GAIN_DB, validate_gain_db, validate_gain_values
 from src.audio.listener import AudioListener
 from src.audio.processor import (
     BEATS_CHECKPOINT_PATH,
@@ -34,6 +35,22 @@ DEFAULT_CHECKPOINT_PATHS = {
     "pann": PANN_CHECKPOINT_PATH,
 }
 DEFAULT_DISTANCE_THRESHOLDS = {"beats": 0.15, "pann": 0.20, "legacy": 2.5}
+
+
+def gain_db_argument(value: str) -> float:
+    """Parse one CLI gain value with an argparse-compatible error."""
+    try:
+        return validate_gain_db(float(value))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def resolve_gain_db(arguments: argparse.Namespace) -> tuple[float, ...]:
+    """Resolve default, custom, or disabled gain augmentation settings."""
+    if arguments.no_gain_augmentation:
+        return ()
+    requested = arguments.gain_db
+    return validate_gain_values(DEFAULT_GAIN_DB if requested is None else requested)
 
 
 def resolve_state_path(model_name: str, requested: Path | None) -> Path:
@@ -132,9 +149,7 @@ def run_application(arguments: argparse.Namespace) -> int:
         checkpoint_sha256 = processor.prepare()
 
     state_path = (
-        None
-        if arguments.no_state
-        else resolve_state_path(arguments.model, arguments.state_path)
+        None if arguments.no_state else resolve_state_path(arguments.model, arguments.state_path)
     )
     distance_mode: DistanceMode = (
         "cosine" if arguments.model in {"beats", "pann"} else "standardized_euclidean"
@@ -142,10 +157,15 @@ def run_application(arguments: argparse.Namespace) -> int:
     threshold = arguments.distance_threshold
     if threshold is None:
         threshold = DEFAULT_DISTANCE_THRESHOLDS[arguments.model]
+    gain_db_values = resolve_gain_db(arguments)
     metadata = {
         "feature_extractor": arguments.model,
         "checkpoint_sha256": checkpoint_sha256,
         "sample_rate": processor.sample_rate,
+        "gain_augmentation": {
+            "gain_db": list(gain_db_values),
+            "peak_safe": True,
+        },
     }
     if arguments.model == "beats":
         metadata.update(
@@ -195,6 +215,7 @@ def run_application(arguments: argparse.Namespace) -> int:
             sample_rate=processor.sample_rate,
             port=arguments.monitor_port,
         )
+        monitor.publish_calibration(controller.calibration_snapshot())
         monitor.start(open_browser=True)
     listener = AudioListener(
         processor,
@@ -210,10 +231,27 @@ def run_application(arguments: argparse.Namespace) -> int:
         decision = controller.process_capture(features, tap_count)
         if monitor is not None:
             monitor.publish_decision(decision)
+            monitor.publish_calibration(controller.calibration_snapshot())
+
+    def process_augmented_capture(
+        features: np.ndarray,
+        tap_count: int,
+        augmented_features: tuple[np.ndarray, ...],
+    ) -> None:
+        decision = controller.process_capture(features, tap_count, augmented_features)
+        if monitor is not None:
+            monitor.publish_decision(decision)
+            monitor.publish_calibration(controller.calibration_snapshot())
 
     def listen() -> None:
         try:
-            listener.listen(process_capture, report_worker_error)
+            listener.listen(
+                process_capture,
+                report_worker_error,
+                process_augmented_capture,
+                controller.is_registering,
+                gain_db_values,
+            )
         except Exception as error:
             listener.last_error = error
             report_worker_error(error)
@@ -228,6 +266,10 @@ def run_application(arguments: argparse.Namespace) -> int:
     print("\n--- Universal Switch Command Line ---")
     print("Commands:")
     print("  register <label> : Collect examples for a tap surface/location")
+    print("  collect-unknown [count] : Collect ordinary sounds (default: 10)")
+    print("  clear-unknown    : Delete collected unknown calibration sounds")
+    print("  calibrate        : Select and validate classifier parameters")
+    print("  cancel           : Cancel the active collection")
     print("  delete <label>   : Delete a class and all of its registered examples")
     print("  list             : List registered labels and example counts")
     print("  status           : Show listener and registration state")
@@ -241,31 +283,64 @@ def run_application(arguments: argparse.Namespace) -> int:
             if command == "quit":
                 break
             if command == "status":
+                calibration = controller.calibration_snapshot()
                 print(
-                    f"[*] mode={controller.mode} registrations={len(classifier.X_data)} "
+                    f"[*] mode={controller.mode} exemplars={len(controller.classifier.X_data)} "
+                    f"unknowns={len(controller.classifier.negative_data)} "
+                    f"calibration={calibration['state']} "
                     f"listener_alive={audio_thread.is_alive()}"
                 )
+                print(f"[*] {calibration['message']}")
             elif command == "list":
-                class_counts = classifier.class_counts()
-                if not class_counts:
+                exemplar_counts = controller.classifier.class_counts()
+                capture_counts = controller.classifier.class_capture_counts()
+                if not exemplar_counts:
                     print("[*] No registered labels.")
                 else:
                     print("[*] Registered labels:")
-                    for label, count in class_counts.items():
-                        suffix = "example" if count == 1 else "examples"
-                        print(f"    - {label}: {count} {suffix}")
+                    for label, count in exemplar_counts.items():
+                        captures = capture_counts[label]
+                        print(f"    - {label}: {captures} physical capture(s), {count} exemplar(s)")
+                print(
+                    f"[*] Unknown calibration captures: {len(controller.classifier.negative_data)}"
+                )
             elif command.startswith("register "):
                 label = user_input.split(" ", 1)[1]
                 controller.set_registration_mode(label, taps=arguments.registration_samples)
+            elif command == "collect-unknown" or command.startswith("collect-unknown "):
+                parts = user_input.split()
+                if len(parts) > 2:
+                    print("[!] Usage: collect-unknown [count]")
+                    continue
+                try:
+                    count = 10 if len(parts) == 1 else int(parts[1])
+                    controller.set_unknown_collection_mode(count)
+                except ValueError as error:
+                    print(f"[!] {error}")
+            elif command == "clear-unknown":
+                controller.clear_unknowns()
+                if monitor is not None:
+                    monitor.publish_calibration(controller.calibration_snapshot())
+            elif command == "cancel":
+                if not controller.cancel_collection():
+                    print("[*] No collection is active.")
+            elif command == "calibrate":
+                try:
+                    controller.calibrate(None if monitor is None else monitor.publish_calibration)
+                except Exception as error:
+                    print(f"[!] Cannot calibrate: {error}")
             elif command.startswith("delete "):
                 label = user_input.split(" ", 1)[1]
                 try:
                     controller.delete_class(label)
                 except ValueError as error:
                     print(f"[!] {error}")
+                if monitor is not None:
+                    monitor.publish_calibration(controller.calibration_snapshot())
             else:
                 print(
-                    "[!] Unknown command. Use 'register <label>', 'delete <label>', "
+                    "[!] Unknown command. Use 'register <label>', 'collect-unknown [count]', "
+                    "'clear-unknown', 'calibrate', 'cancel', 'delete <label>', "
                     "'list', 'status', or 'quit'."
                 )
     except (EOFError, KeyboardInterrupt):
@@ -300,6 +375,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--event-cooldown", type=float, default=2.0)
     parser.add_argument("--energy-threshold", type=float, default=0.015)
     parser.add_argument("--registration-samples", type=int, default=10)
+    gain_group = parser.add_mutually_exclusive_group()
+    gain_group.add_argument(
+        "--gain-db",
+        action="append",
+        type=gain_db_argument,
+        help="gain in dB to add per registration; repeat for multiple values",
+    )
+    gain_group.add_argument("--no-gain-augmentation", action="store_true")
     parser.add_argument("--monitor-port", type=int, default=8765)
     parser.add_argument("--no-monitor", action="store_true")
     return parser.parse_args()

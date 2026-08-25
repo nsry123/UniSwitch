@@ -121,6 +121,29 @@ canvas { display: block; width: 100%; height: 100%; }
   background: linear-gradient(115deg, rgba(72, 35, 34, 0.78), var(--panel));
 }
 
+.calibration-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(420px, 0.9fr);
+  gap: 36px;
+  align-items: center;
+}
+
+.calibration-panel.ready, .calibration-panel.passed {
+  border-color: rgba(88, 224, 176, 0.42);
+}
+
+.calibration-panel.running, .calibration-panel.stale {
+  border-color: rgba(244, 185, 95, 0.42);
+}
+
+.calibration-panel.failed {
+  border-color: rgba(255, 120, 111, 0.42);
+}
+
+.calibration-progress { margin: 10px 0 0; color: var(--amber); font-size: 0.78rem; }
+.calibration-parameters { grid-column: 1 / -1; }
+.calibration-parameters dd { white-space: normal; }
+
 .result-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
 .result-heading .eyebrow { margin-bottom: 0; }
 .result-copy h2 { font-size: clamp(1.45rem, 3vw, 2.1rem); }
@@ -165,7 +188,7 @@ canvas { display: block; width: 100%; height: 100%; }
   main { width: min(100% - 24px, 1180px); padding-top: 28px; }
   header { align-items: flex-start; flex-direction: column; }
   .metrics { grid-template-columns: repeat(2, 1fr); margin-top: 28px; }
-  .result-panel { grid-template-columns: 1fr; gap: 24px; }
+  .result-panel, .calibration-panel { grid-template-columns: 1fr; gap: 24px; }
   .panel { padding: 18px 16px 14px; }
   .chart-wrap { height: 270px; }
 }

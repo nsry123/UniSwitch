@@ -22,6 +22,21 @@ def test_monitor_publishes_audio_snapshot() -> None:
     assert snapshot["active"] is True
     assert snapshot["waveform"] == [-0.25, 0.5]
     assert snapshot["lastResult"] is None
+    assert snapshot["calibration"]["state"] == "needs_data"
+
+
+def test_monitor_publishes_calibration_and_unknown_capture() -> None:
+    monitor = MicrophoneMonitor(threshold=0.015, sample_rate=16000)
+    controller = SwitchController(TapClassifier())
+    controller.set_unknown_collection_mode(1)
+    decision = controller.process_capture(np.array([1.0, 2.0]), tap_count=1)
+    monitor.publish_decision(decision)
+    monitor.publish_calibration(controller.calibration_snapshot())
+
+    snapshot = monitor.snapshot()
+    assert snapshot["lastResult"]["purpose"] == "unknown_calibration"
+    assert snapshot["lastResult"]["label"] == "Unknown calibration"
+    assert snapshot["calibration"]["unknownCaptureCount"] == 1
 
 
 def test_monitor_publishes_last_knock_result_and_reason() -> None:
@@ -61,5 +76,6 @@ def test_monitor_serves_dashboard_and_audio_api() -> None:
 
     assert "Microphone monitor" in page
     assert "Latest knock" in page
+    assert "Interactive calibration" in page
     assert state["threshold"] == 0.01
     assert state["sampleRate"] == 16000

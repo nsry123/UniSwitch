@@ -11,9 +11,13 @@ import librosa
 import numpy as np
 import pyaudio
 
+from src.audio.augmentation import apply_gain_db, validate_gain_values
+
 AudioCallback = Callable[[np.ndarray, int], object]
+AugmentedAudioCallback = Callable[[np.ndarray, int, tuple[np.ndarray, ...]], object]
 ErrorCallback = Callable[[Exception], object]
 FrameCallback = Callable[[np.ndarray, float, bool], object]
+AugmentationPredicate = Callable[[], bool]
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,9 @@ class AudioListener:
         self,
         trigger_callback: AudioCallback,
         error_callback: ErrorCallback | None = None,
+        augmented_trigger_callback: AugmentedAudioCallback | None = None,
+        should_augment: AugmentationPredicate | None = None,
+        gain_db_values: tuple[float, ...] = (),
     ) -> None:
         """
         Opens the mic and starts two threads:
@@ -142,9 +149,16 @@ class AudioListener:
                 input_device_index=self.device_index,
                 frames_per_buffer=self.chunk_size,
             )
+            validated_gains = validate_gain_values(gain_db_values)
             worker = threading.Thread(
                 target=self._worker_loop,
-                args=(trigger_callback, error_callback),
+                args=(
+                    trigger_callback,
+                    error_callback,
+                    augmented_trigger_callback,
+                    should_augment,
+                    validated_gains,
+                ),
                 daemon=True,
             )
             worker.start()
@@ -271,6 +285,9 @@ class AudioListener:
         self,
         trigger_callback: AudioCallback,
         error_callback: ErrorCallback | None = None,
+        augmented_trigger_callback: AugmentedAudioCallback | None = None,
+        should_augment: AugmentationPredicate | None = None,
+        gain_db_values: tuple[float, ...] = (),
     ) -> None:
         """
         Runs on a background daemon thread. Dequeues complete audio clips
@@ -292,7 +309,23 @@ class AudioListener:
                 count_waveform = capture.waveform[capture.trigger_sample :]
                 tap_count = self.processor.count_taps(count_waveform, self.threshold)
                 features = self.processor.extract_features(capture.waveform)
-                trigger_callback(features, tap_count)
+                augment_capture = (
+                    augmented_trigger_callback is not None
+                    and should_augment is not None
+                    and should_augment()
+                    and bool(gain_db_values)
+                )
+                if augment_capture:
+                    assert augmented_trigger_callback is not None
+                    augmented_features = tuple(
+                        self.processor.extract_features(
+                            apply_gain_db(capture.waveform, gain_db)
+                        )
+                        for gain_db in gain_db_values
+                    )
+                    augmented_trigger_callback(features, tap_count, augmented_features)
+                else:
+                    trigger_callback(features, tap_count)
             except Exception as error:
                 self.last_error = error
                 if error_callback is not None:

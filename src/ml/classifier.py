@@ -17,7 +17,9 @@ from sklearn.preprocessing import StandardScaler
 
 DistanceMode = Literal["cosine", "standardized_euclidean"]
 DISTANCE_MODES = frozenset({"cosine", "standardized_euclidean"})
-MIN_CLASS_SAMPLES = 3
+MIN_CLASS_CAPTURES = 3
+# Backward-compatible import name. Eligibility is now based on physical captures.
+MIN_CLASS_SAMPLES = MIN_CLASS_CAPTURES
 
 
 def validate_distance_mode(distance_mode: str) -> DistanceMode:
@@ -78,7 +80,7 @@ class _ClassScore:
 class TapClassifier:
     """Incrementally learn classes and reject distant or ambiguous inputs."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
 
     def __init__(
         self,
@@ -119,6 +121,13 @@ class TapClassifier:
         )
         self.X_data: list[np.ndarray] = []
         self.y_labels: list[str] = []
+        self.capture_ids: list[int] = []
+        self.augmented_flags: list[bool] = []
+        self.negative_data: list[np.ndarray] = []
+        self.negative_capture_ids: list[int] = []
+        self.next_capture_id = 0
+        self.data_revision = 0
+        self.calibration_report: dict[str, Any] | None = None
         self.is_trained = False
         self.feature_dim: int | None = None
         self.metadata: dict[str, Any] = {}
@@ -201,18 +210,30 @@ class TapClassifier:
             self.scaler.fit(raw)
         transformed = self._transform_matrix(raw)
         labels = np.asarray(self.y_labels)
+        capture_ids = np.asarray(self.capture_ids, dtype=np.int64)
+        augmented = np.asarray(self.augmented_flags, dtype=np.bool_)
         statistics: dict[str, _ClassStatistics] = {}
         for label in sorted(set(self.y_labels)):
-            exemplars = transformed[labels == label]
-            if len(exemplars) < MIN_CLASS_SAMPLES:
+            class_mask = labels == label
+            exemplars = transformed[class_mask]
+            class_capture_ids = capture_ids[class_mask]
+            class_augmented = augmented[class_mask]
+            unique_captures = np.unique(class_capture_ids)
+            if len(unique_captures) < MIN_CLASS_CAPTURES:
                 continue
             prototype = self._prototype(exemplars)
             leave_one_out_scores: list[float] = []
-            for index, vector in enumerate(exemplars):
-                other = np.delete(exemplars, index, axis=0)
+            for capture_id in unique_captures:
+                query_mask = (class_capture_ids == capture_id) & ~class_augmented
+                other = exemplars[class_capture_ids != capture_id]
+                if not query_mask.any() or other.size == 0:
+                    continue
                 other_prototype = self._prototype(other)
-                _, _, score = self._score_against(vector, other_prototype, other)
-                leave_one_out_scores.append(score)
+                for vector in exemplars[query_mask]:
+                    _, _, score = self._score_against(vector, other_prototype, other)
+                    leave_one_out_scores.append(score)
+            if not leave_one_out_scores:
+                continue
             within_mean = float(np.mean(leave_one_out_scores))
             within_std = float(np.std(leave_one_out_scores))
             acceptance_radius = min(
@@ -242,8 +263,21 @@ class TapClassifier:
         assert self._transformed_features is not None
         return min(self._distance(transformed, row) for row in self._transformed_features)
 
+    def allocate_capture_id(self) -> int:
+        """Return a new physical-capture identifier."""
+        with self._lock:
+            capture_id = self.next_capture_id
+            self.next_capture_id += 1
+            return capture_id
+
     def register_tap(
-        self, feature_vector: np.ndarray, label: str, *, announce: bool = True
+        self,
+        feature_vector: np.ndarray,
+        label: str,
+        *,
+        announce: bool = True,
+        capture_id: int | None = None,
+        augmented: bool = False,
     ) -> None:
         """Add one captured-window example and rebuild derived class statistics."""
         with self._lock:
@@ -251,17 +285,55 @@ class TapClassifier:
             vector = self._validate_feature(feature_vector)
             if self.feature_dim is None:
                 self.feature_dim = int(vector.size)
+            if capture_id is None:
+                capture_id = self.allocate_capture_id()
+            elif capture_id < 0:
+                raise ValueError("capture_id must be non-negative")
+            self.next_capture_id = max(self.next_capture_id, capture_id + 1)
             self.X_data.append(vector)
             self.y_labels.append(normalized_label)
+            self.capture_ids.append(int(capture_id))
+            self.augmented_flags.append(bool(augmented))
+            self.data_revision += 1
+            self.calibration_report = None
             self._fit_if_ready()
-            class_count = self.y_labels.count(normalized_label)
+            class_count = self.class_capture_counts()[normalized_label]
             if not announce:
                 return
-            if class_count >= MIN_CLASS_SAMPLES:
+            if class_count >= MIN_CLASS_CAPTURES:
                 print(f"[*] Model updated. Total registered samples: {len(self.X_data)}")
             else:
-                remaining = MIN_CLASS_SAMPLES - class_count
+                remaining = MIN_CLASS_CAPTURES - class_count
                 print(f"[*] Sample recorded. Need {remaining} more for '{normalized_label}'.")
+
+    def register_unknown(
+        self, feature_vector: np.ndarray, *, capture_id: int | None = None
+    ) -> None:
+        """Store one unaugmented negative capture for rejection calibration."""
+        with self._lock:
+            vector = self._validate_feature(feature_vector)
+            if self.feature_dim is None:
+                self.feature_dim = int(vector.size)
+            if capture_id is None:
+                capture_id = self.allocate_capture_id()
+            elif capture_id < 0:
+                raise ValueError("capture_id must be non-negative")
+            self.next_capture_id = max(self.next_capture_id, capture_id + 1)
+            self.negative_data.append(vector)
+            self.negative_capture_ids.append(int(capture_id))
+            self.data_revision += 1
+            self.calibration_report = None
+
+    def clear_unknowns(self) -> int:
+        """Remove all negative calibration captures."""
+        with self._lock:
+            count = len(self.negative_data)
+            if count:
+                self.negative_data = []
+                self.negative_capture_ids = []
+                self.data_revision += 1
+                self.calibration_report = None
+            return count
 
     def delete_class(self, label: str) -> int:
         """Delete every registered example for a class and rebuild statistics."""
@@ -277,6 +349,10 @@ class TapClassifier:
             retained = [index for index in range(len(self.y_labels)) if index not in matching]
             self.X_data = [self.X_data[index] for index in retained]
             self.y_labels = [self.y_labels[index] for index in retained]
+            self.capture_ids = [self.capture_ids[index] for index in retained]
+            self.augmented_flags = [self.augmented_flags[index] for index in retained]
+            self.data_revision += 1
+            self.calibration_report = None
             if not self.X_data:
                 self.feature_dim = None
             self._fit_if_ready()
@@ -285,8 +361,22 @@ class TapClassifier:
     def class_counts(self) -> dict[str, int]:
         """Return registered labels and example counts in deterministic order."""
         with self._lock:
+            return {label: self.y_labels.count(label) for label in sorted(set(self.y_labels))}
+
+    def class_capture_counts(self) -> dict[str, int]:
+        """Return independent physical-capture counts for every class."""
+        with self._lock:
             return {
-                label: self.y_labels.count(label) for label in sorted(set(self.y_labels))
+                label: len(
+                    {
+                        capture_id
+                        for registered_label, capture_id in zip(
+                            self.y_labels, self.capture_ids, strict=True
+                        )
+                        if registered_label == label
+                    }
+                )
+                for label in sorted(set(self.y_labels))
             }
 
     def predict_detailed(self, feature_vector: np.ndarray) -> PredictionResult:
@@ -294,7 +384,14 @@ class TapClassifier:
         with self._lock:
             if not self.is_trained:
                 return PredictionResult(
-                    "Unknown", False, MappingProxyType({}), None, None, None, None, None,
+                    "Unknown",
+                    False,
+                    MappingProxyType({}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                     self.margin_threshold,
                     "insufficient_class_samples",
                 )
@@ -307,7 +404,10 @@ class TapClassifier:
                 )
                 scores.append(
                     _ClassScore(
-                        label, prototype_distance, exemplar_distance, score,
+                        label,
+                        prototype_distance,
+                        exemplar_distance,
+                        score,
                         statistics.acceptance_radius,
                     )
                 )
@@ -361,8 +461,8 @@ class TapClassifier:
     def save(self, path: str | Path, metadata: Mapping[str, Any] | None = None) -> None:
         """Atomically persist raw examples and reproducibility metadata as NPZ."""
         with self._lock:
-            if not self.X_data:
-                raise ValueError("cannot save a classifier with no registered samples")
+            if not self.X_data and not self.negative_data:
+                raise ValueError("cannot save a classifier with no captured samples")
             destination = Path(path).expanduser().resolve()
             destination.parent.mkdir(parents=True, exist_ok=True)
             payload_metadata = dict(self.metadata)
@@ -378,8 +478,17 @@ class TapClassifier:
                 "margin_threshold": self.margin_threshold,
                 "probability_temperature": self.probability_temperature,
                 "feature_dim": self.feature_dim,
+                "next_capture_id": self.next_capture_id,
+                "data_revision": self.data_revision,
+                "calibration_report": self.calibration_report,
                 "metadata": payload_metadata,
             }
+            feature_matrix = np.empty((0, self.feature_dim or 0), dtype=np.float64)
+            if self.X_data:
+                feature_matrix = np.vstack(self.X_data)
+            negative_features = np.empty((0, self.feature_dim or 0), dtype=np.float64)
+            if self.negative_data:
+                negative_features = np.vstack(self.negative_data)
             temporary_path: Path | None = None
             try:
                 with tempfile.NamedTemporaryFile(
@@ -391,8 +500,12 @@ class TapClassifier:
                     temporary_path = Path(temporary_file.name)
                     np.savez_compressed(
                         temporary_file,
-                        features=np.vstack(self.X_data),
+                        features=feature_matrix,
                         labels=np.asarray(self.y_labels, dtype=np.str_),
+                        capture_ids=np.asarray(self.capture_ids, dtype=np.int64),
+                        augmented=np.asarray(self.augmented_flags, dtype=np.bool_),
+                        negative_features=negative_features,
+                        negative_capture_ids=np.asarray(self.negative_capture_ids, dtype=np.int64),
                         manifest=np.asarray(json.dumps(payload, sort_keys=True)),
                     )
                     temporary_file.flush()
@@ -406,40 +519,57 @@ class TapClassifier:
 
     @classmethod
     def load(cls, path: str | Path) -> TapClassifier:
-        """Load registrations, upgrading older schemas in memory."""
+        """Load schema-v4 registrations and calibration data."""
         source = Path(path).expanduser().resolve()
         with np.load(source, allow_pickle=False) as persisted:
-            required = {"features", "labels", "manifest"}
+            if "manifest" not in persisted.files:
+                raise ValueError("classifier state is missing manifest")
+            manifest = json.loads(str(persisted["manifest"].item()))
+            schema_version = manifest.get("schema_version")
+            if schema_version != cls.SCHEMA_VERSION:
+                raise ValueError(
+                    f"state schema {schema_version!r} predates physical capture tracking; "
+                    "re-register using a new --state-path or remove the old state file"
+                )
+            required = {
+                "features",
+                "labels",
+                "capture_ids",
+                "augmented",
+                "negative_features",
+                "negative_capture_ids",
+                "manifest",
+            }
             if not required.issubset(persisted.files):
                 raise ValueError(
                     f"classifier state is missing keys: {required - set(persisted.files)}"
                 )
-            manifest = json.loads(str(persisted["manifest"].item()))
-            schema_version = manifest.get("schema_version")
-            if schema_version not in {1, 2, cls.SCHEMA_VERSION}:
-                raise ValueError(f"unsupported classifier schema: {schema_version}")
             features = np.asarray(persisted["features"], dtype=np.float64)
             labels = np.asarray(persisted["labels"], dtype=np.str_)
-        if features.ndim != 2 or features.shape[0] == 0:
-            raise ValueError("persisted features must be a non-empty 2D array")
+            capture_ids = np.asarray(persisted["capture_ids"], dtype=np.int64)
+            augmented = np.asarray(persisted["augmented"], dtype=np.bool_)
+            negative_features = np.asarray(persisted["negative_features"], dtype=np.float64)
+            negative_capture_ids = np.asarray(persisted["negative_capture_ids"], dtype=np.int64)
+        if features.ndim != 2:
+            raise ValueError("persisted features must be a 2D array")
         if labels.ndim != 1 or labels.shape[0] != features.shape[0]:
             raise ValueError("persisted labels do not align with features")
+        if capture_ids.shape != labels.shape or augmented.shape != labels.shape:
+            raise ValueError("persisted capture metadata does not align with features")
+        if negative_features.ndim != 2 or negative_features.shape[1] != features.shape[1]:
+            raise ValueError("persisted negative features have the wrong dimension")
+        if negative_capture_ids.shape != (negative_features.shape[0],):
+            raise ValueError("persisted negative capture IDs do not align with features")
         if not np.isfinite(features).all():
             raise ValueError("persisted features contain NaN or infinite values")
+        if features.shape[0] == 0 and negative_features.shape[0] == 0:
+            raise ValueError("persisted state contains no captured samples")
         if int(manifest["feature_dim"]) != features.shape[1]:
             raise ValueError("persisted feature dimension does not match manifest")
         metadata = dict(manifest.get("metadata", {}))
-        if schema_version == 1:
-            if metadata.get("feature_extractor") == "pann":
-                raise ValueError(
-                    "schema-v1 PANN registrations use the obsolete standardized-Euclidean "
-                    "distance; re-register using a new --state-path or remove the old state file"
-                )
-            distance_mode: DistanceMode = "standardized_euclidean"
-        else:
-            if "distance_mode" not in manifest:
-                raise ValueError("classifier state is missing distance_mode")
-            distance_mode = validate_distance_mode(str(manifest["distance_mode"]))
+        if "distance_mode" not in manifest:
+            raise ValueError("classifier state is missing distance_mode")
+        distance_mode = validate_distance_mode(str(manifest["distance_mode"]))
         threshold = float(manifest["distance_threshold"])
         classifier = cls(
             n_neighbors=int(manifest["n_neighbors"]),
@@ -448,13 +578,22 @@ class TapClassifier:
             prototype_weight=float(manifest.get("prototype_weight", 0.5)),
             spread_multiplier=float(manifest.get("spread_multiplier", 2.0)),
             margin_threshold=float(manifest.get("margin_threshold", 0.1 * threshold)),
-            probability_temperature=float(
-                manifest.get("probability_temperature", 0.5 * threshold)
-            ),
+            probability_temperature=float(manifest.get("probability_temperature", 0.5 * threshold)),
         )
         classifier.feature_dim = features.shape[1]
         classifier.X_data = [row.copy() for row in features]
         classifier.y_labels = [str(label) for label in labels]
+        classifier.capture_ids = [int(value) for value in capture_ids]
+        classifier.augmented_flags = [bool(value) for value in augmented]
+        classifier.negative_data = [row.copy() for row in negative_features]
+        classifier.negative_capture_ids = [int(value) for value in negative_capture_ids]
+        classifier.next_capture_id = int(manifest.get("next_capture_id", 0))
+        all_capture_ids = classifier.capture_ids + classifier.negative_capture_ids
+        if all_capture_ids:
+            classifier.next_capture_id = max(classifier.next_capture_id, max(all_capture_ids) + 1)
+        classifier.data_revision = int(manifest.get("data_revision", 0))
+        report = manifest.get("calibration_report")
+        classifier.calibration_report = dict(report) if isinstance(report, dict) else None
         classifier.metadata = metadata
         classifier._fit_if_ready()
         return classifier
