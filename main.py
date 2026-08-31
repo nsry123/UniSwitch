@@ -16,7 +16,10 @@ from src.audio.listener import AudioListener
 from src.audio.processor import (
     BEATS_CHECKPOINT_PATH,
     BEATS_EMBEDDING_DIM,
+    BEATS_FEATURE_ALIGNMENT,
+    BEATS_FEATURE_WINDOW_SECONDS,
     BEATS_POOLING,
+    BEATS_PRE_ONSET_SECONDS,
     BEATS_SOURCE_REVISION,
     PANN_CHECKPOINT_PATH,
     SignalProcessor,
@@ -26,7 +29,7 @@ from src.ml.classifier import DistanceMode, TapClassifier
 from src.web.app import MicrophoneMonitor
 
 DEFAULT_STATE_PATHS = {
-    "beats": Path("state/beats-registrations.npz"),
+    "beats": Path("state/beats-onset200-registrations.npz"),
     "pann": Path("state/registrations.npz"),
     "legacy": Path("state/legacy-registrations.npz"),
 }
@@ -121,11 +124,19 @@ def load_or_create_classifier(
             "use a compatible state file"
         )
     if model_name == "beats":
-        for key in ("sample_rate", "embedding_dim", "pooling", "source_revision"):
+        for key in (
+            "sample_rate",
+            "embedding_dim",
+            "pooling",
+            "source_revision",
+            "feature_window",
+            "energy_threshold",
+        ):
             if classifier.metadata.get(key) != extractor_metadata.get(key):
                 raise ValueError(
                     f"state file BEATs {key} differs from the selected encoder; "
-                    "use a compatible state file"
+                    "re-register using the onset-aligned default state path or "
+                    "select a compatible state file"
                 )
     if classifier.distance_mode != distance_mode:
         raise ValueError(
@@ -173,6 +184,12 @@ def run_application(arguments: argparse.Namespace) -> int:
                 "embedding_dim": BEATS_EMBEDDING_DIM,
                 "pooling": BEATS_POOLING,
                 "source_revision": BEATS_SOURCE_REVISION,
+                "feature_window": {
+                    "alignment": BEATS_FEATURE_ALIGNMENT,
+                    "duration_seconds": BEATS_FEATURE_WINDOW_SECONDS,
+                    "pre_onset_seconds": BEATS_PRE_ONSET_SECONDS,
+                },
+                "energy_threshold": arguments.energy_threshold,
             }
         )
     classifier = load_or_create_classifier(
@@ -251,6 +268,7 @@ def run_application(arguments: argparse.Namespace) -> int:
                 process_augmented_capture,
                 controller.is_registering,
                 gain_db_values,
+                None if monitor is None else monitor.publish_feature_window,
             )
         except Exception as error:
             listener.last_error = error

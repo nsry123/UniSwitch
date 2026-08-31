@@ -1,7 +1,13 @@
 import numpy as np
 import pytest
 
-from src.audio.processor import BEATS_CHECKPOINT_PATH, BEATS_EMBEDDING_DIM, SignalProcessor
+from src.audio.processor import (
+    BEATS_CHECKPOINT_PATH,
+    BEATS_EMBEDDING_DIM,
+    BEATS_FEATURE_WINDOW_SECONDS,
+    BEATS_PRE_ONSET_SECONDS,
+    SignalProcessor,
+)
 
 
 def synthetic_three_knocks(sample_rate: int = 16000) -> np.ndarray:
@@ -73,6 +79,68 @@ def test_threshold_counter_rejects_invalid_threshold() -> None:
 
     with pytest.raises(ValueError, match="energy_threshold"):
         processor.count_taps(waveform, energy_threshold=-0.1)
+
+
+def test_beats_prepares_fixed_first_onset_window() -> None:
+    processor = SignalProcessor(model="beats")
+    waveform = np.zeros(14000, dtype=np.float32)
+    waveform[5000:5320] = 0.1
+
+    prepared = processor.prepare_feature_audio(waveform, 4000, 0.015)
+
+    window_samples = round(BEATS_FEATURE_WINDOW_SECONDS * processor.sample_rate)
+    pre_onset_samples = round(BEATS_PRE_ONSET_SECONDS * processor.sample_rate)
+    detected_onset = 4800
+    expected_start = detected_onset - pre_onset_samples
+    assert processor.feature_window_bounds(waveform, 4000, 0.015) == (
+        expected_start,
+        detected_onset,
+        expected_start + window_samples,
+    )
+    assert prepared.shape == (window_samples,)
+    np.testing.assert_array_equal(
+        prepared,
+        waveform[expected_start : expected_start + window_samples],
+    )
+
+
+def test_beats_onset_window_zero_pads_recording_boundaries() -> None:
+    processor = SignalProcessor(model="beats")
+    window_samples = round(BEATS_FEATURE_WINDOW_SECONDS * processor.sample_rate)
+    pre_onset_samples = round(BEATS_PRE_ONSET_SECONDS * processor.sample_rate)
+
+    left_waveform = np.zeros(12000, dtype=np.float32)
+    left_waveform[:320] = 0.1
+    left = processor.prepare_feature_audio(left_waveform, 0, 0.015)
+    np.testing.assert_array_equal(left[:pre_onset_samples], 0.0)
+    np.testing.assert_array_equal(
+        left[pre_onset_samples:], left_waveform[: window_samples - pre_onset_samples]
+    )
+
+    right_waveform = np.zeros(6000, dtype=np.float32)
+    right_waveform[5000:5320] = 0.1
+    right = processor.prepare_feature_audio(right_waveform, 4000, 0.015)
+    source_start = 4800 - pre_onset_samples
+    copied = right_waveform.size - source_start
+    np.testing.assert_array_equal(right[:copied], right_waveform[source_start:])
+    np.testing.assert_array_equal(right[copied:], 0.0)
+
+
+def test_beats_onset_window_requires_threshold_crossing() -> None:
+    processor = SignalProcessor(model="beats")
+
+    with pytest.raises(ValueError, match="no threshold-qualified onset"):
+        processor.prepare_feature_audio(np.zeros(8000, dtype=np.float32), 0, 0.015)
+
+
+@pytest.mark.parametrize("model", ["legacy", "pann"])
+def test_non_beats_feature_audio_remains_full_length(model: str) -> None:
+    processor = SignalProcessor(model=model)
+    waveform = np.linspace(-0.1, 0.1, 1000, dtype=np.float32)
+
+    prepared = processor.prepare_feature_audio(waveform, 500, 0.015)
+
+    np.testing.assert_array_equal(prepared, waveform)
 
 
 def test_zero_threshold_ignores_silence_and_rearms() -> None:

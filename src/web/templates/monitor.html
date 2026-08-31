@@ -82,7 +82,10 @@
             <p class="eyebrow">Detection signal</p>
             <h2>Energy over time</h2>
           </div>
-          <div class="legend"><span></span> Threshold <b id="threshold-legend">0.0150</b></div>
+          <div class="chart-legends">
+            <div class="legend"><span></span> Threshold <b id="threshold-legend">0.0150</b></div>
+            <div class="legend feature-legend"><span></span> BEATs feature window</div>
+          </div>
         </div>
         <div class="chart-wrap">
           <canvas id="energy-chart" aria-label="Live RMS energy with trigger threshold"></canvas>
@@ -102,7 +105,7 @@
         </div>
       </section>
 
-      <p class="hint">A knock starts capture when the green energy trace crosses the amber threshold.</p>
+      <p class="hint">The blue band marks the 580 ms BEATs window: 200 ms before the dashed onset marker and 380 ms after it.</p>
     </main>
     <script src="/monitor.js"></script>
   </body>

@@ -88,6 +88,7 @@ class MicrophoneMonitor:
         self._capturing = False
         self._waveform: list[float] = []
         self._updated_at = 0.0
+        self._feature_window: dict[str, float] | None = None
         self._result_sequence = 0
         self._last_result: dict[str, Any] | None = None
         self._calibration: dict[str, Any] = {
@@ -133,9 +134,31 @@ class MicrophoneMonitor:
                 "waveform": self._waveform,
                 "sampleRate": self.sample_rate,
                 "active": self._updated_at > 0 and time.monotonic() - self._updated_at < 1.0,
+                "featureWindow": self._feature_window,
                 "resultSequence": self._result_sequence,
                 "lastResult": self._last_result,
                 "calibration": self._calibration,
+            }
+
+    def publish_feature_window(
+        self,
+        start_sequence: float,
+        onset_sequence: float,
+        end_sequence: float,
+    ) -> None:
+        """Mark the exact BEATs feature interval on the energy timeline."""
+        values = np.asarray(
+            [start_sequence, onset_sequence, end_sequence], dtype=np.float64
+        )
+        if not np.isfinite(values).all():
+            raise ValueError("feature window sequences must be finite")
+        if not start_sequence <= onset_sequence <= end_sequence:
+            raise ValueError("feature window sequences must be ordered")
+        with self._lock:
+            self._feature_window = {
+                "startSequence": float(start_sequence),
+                "onsetSequence": float(onset_sequence),
+                "endSequence": float(end_sequence),
             }
 
     def publish_calibration(self, calibration: Mapping[str, Any]) -> None:

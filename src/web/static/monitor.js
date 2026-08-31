@@ -32,6 +32,7 @@ let latestWaveform = [];
 let threshold = 0.015;
 let lastSequence = -1;
 let lastResultSequence = -1;
+let latestFeatureWindow = null;
 
 function renderResult(result) {
   if (!result) return;
@@ -107,7 +108,11 @@ function drawEnergy() {
   const pad = { top: 18 * ratio, right: 18 * ratio, bottom: 27 * ratio, left: 54 * ratio };
   const chartWidth = width - pad.left - pad.right;
   const chartHeight = height - pad.top - pad.bottom;
-  const observedMax = Math.max(threshold * 2, 0.001, ...history);
+  const observedMax = Math.max(
+    threshold * 2,
+    0.001,
+    ...history.map((point) => point.energy),
+  );
   const yMax = observedMax * 1.18;
   const y = (value) => pad.top + chartHeight - (value / yMax) * chartHeight;
 
@@ -140,14 +145,53 @@ function drawEnergy() {
   ctx.fillText(`THRESHOLD ${threshold.toFixed(4)}`, pad.left + 8 * ratio, thresholdY - 8 * ratio);
 
   if (history.length > 1) {
+    const firstSequence = history[0].sequence;
+    const lastSequenceInHistory = history[history.length - 1].sequence;
     const gradient = ctx.createLinearGradient(0, pad.top, 0, height - pad.bottom);
     gradient.addColorStop(0, "rgba(88, 224, 176, 0.26)");
     gradient.addColorStop(1, "rgba(88, 224, 176, 0.01)");
     const x = (index) => pad.left + (index / (maxPoints - 1)) * chartWidth;
+
+    if (
+      latestFeatureWindow &&
+      latestFeatureWindow.endSequence >= firstSequence &&
+      latestFeatureWindow.startSequence <= lastSequenceInHistory
+    ) {
+      const sequenceX = (sequence) => {
+        const fraction = (sequence - firstSequence) /
+          Math.max(1, lastSequenceInHistory - firstSequence);
+        const historyIndex = fraction * (history.length - 1);
+        return x(historyIndex);
+      };
+      const windowStart = Math.max(pad.left, sequenceX(latestFeatureWindow.startSequence));
+      const windowEnd = Math.min(
+        width - pad.right,
+        sequenceX(latestFeatureWindow.endSequence),
+      );
+      const onsetX = Math.min(
+        width - pad.right,
+        Math.max(pad.left, sequenceX(latestFeatureWindow.onsetSequence)),
+      );
+      ctx.fillStyle = "rgba(80, 150, 255, 0.16)";
+      ctx.fillRect(windowStart, pad.top, Math.max(1, windowEnd - windowStart), chartHeight);
+      ctx.strokeStyle = "rgba(108, 174, 255, 0.9)";
+      ctx.lineWidth = 1.5 * ratio;
+      ctx.setLineDash([4 * ratio, 3 * ratio]);
+      ctx.beginPath();
+      ctx.moveTo(onsetX, pad.top);
+      ctx.lineTo(onsetX, height - pad.bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#8fc2ff";
+      ctx.font = `${11 * ratio}px ui-monospace, SFMono-Regular, monospace`;
+      ctx.textAlign = "left";
+      ctx.fillText("BEATs FEATURE 580 ms", windowStart + 6 * ratio, pad.top + 14 * ratio);
+    }
+
     ctx.beginPath();
-    history.forEach((value, index) => {
-      if (index === 0) ctx.moveTo(x(index), y(value));
-      else ctx.lineTo(x(index), y(value));
+    history.forEach((point, index) => {
+      if (index === 0) ctx.moveTo(x(index), y(point.energy));
+      else ctx.lineTo(x(index), y(point.energy));
     });
     ctx.lineTo(x(history.length - 1), height - pad.bottom);
     ctx.lineTo(pad.left, height - pad.bottom);
@@ -156,9 +200,9 @@ function drawEnergy() {
     ctx.fill();
 
     ctx.beginPath();
-    history.forEach((value, index) => {
-      if (index === 0) ctx.moveTo(x(index), y(value));
-      else ctx.lineTo(x(index), y(value));
+    history.forEach((point, index) => {
+      if (index === 0) ctx.moveTo(x(index), y(point.energy));
+      else ctx.lineTo(x(index), y(point.energy));
     });
     ctx.strokeStyle = "#58e0b0";
     ctx.lineWidth = 2 * ratio;
@@ -197,11 +241,12 @@ async function poll() {
     const state = await response.json();
     threshold = state.threshold;
     if (state.sequence !== lastSequence) {
-      history.push(state.energy);
+      history.push({ sequence: state.sequence, energy: state.energy });
       if (history.length > maxPoints) history.shift();
       latestWaveform = state.waveform;
       lastSequence = state.sequence;
     }
+    latestFeatureWindow = state.featureWindow;
     if (state.resultSequence !== lastResultSequence) {
       renderResult(state.lastResult);
       lastResultSequence = state.resultSequence;

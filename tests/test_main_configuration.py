@@ -43,7 +43,7 @@ def test_model_specific_checkpoint_and_state_paths() -> None:
     assert resolve_checkpoint_path("beats", None) == BEATS_CHECKPOINT_PATH
     assert resolve_checkpoint_path("pann", None) == PANN_CHECKPOINT_PATH
     assert resolve_checkpoint_path("legacy", None) is None
-    assert resolve_state_path("beats", None).name == "beats-registrations.npz"
+    assert resolve_state_path("beats", None).name == "beats-onset200-registrations.npz"
     assert resolve_state_path("pann", None).name == "registrations.npz"
     assert resolve_state_path("legacy", None).name == "legacy-registrations.npz"
 
@@ -81,6 +81,7 @@ def test_beats_is_evaluator_default(monkeypatch) -> None:
 
     assert arguments.model == "beats"
     assert arguments.checkpoint is None
+    assert arguments.energy_threshold == 0.015
 
 
 def test_pann_state_remains_available_only_for_pann(tmp_path) -> None:
@@ -164,3 +165,59 @@ def test_beats_state_rejects_pooling_contract_change(tmp_path) -> None:
             None,
             None,
         )
+
+
+def test_beats_state_rejects_missing_onset_window_contract(tmp_path) -> None:
+    state_path = tmp_path / "old-beats.npz"
+    classifier = TapClassifier(n_neighbors=1, distance_threshold=0.15, distance_mode="cosine")
+    for offset in (0.0, 0.01, -0.01):
+        classifier.register_tap(np.array([1.0, offset]), "desk")
+    old_metadata = {
+        "feature_extractor": "beats",
+        "checkpoint_sha256": "beats-sha",
+        "sample_rate": 16000,
+        "embedding_dim": 768,
+        "pooling": "mean",
+        "source_revision": "revision",
+    }
+    classifier.save(state_path, old_metadata)
+    current_metadata = {
+        **old_metadata,
+        "feature_window": {
+            "alignment": "first_threshold_onset",
+            "duration_seconds": 0.58,
+            "pre_onset_seconds": 0.2,
+        },
+        "energy_threshold": 0.015,
+    }
+
+    with pytest.raises(ValueError, match="re-register using the onset-aligned"):
+        load_or_create_classifier(
+            state_path,
+            "beats",
+            current_metadata,
+            1,
+            0.15,
+            "cosine",
+            0.5,
+            2.0,
+            None,
+            None,
+        )
+
+    compatible_path = tmp_path / "onset-beats.npz"
+    classifier.save(compatible_path, current_metadata)
+    restored = load_or_create_classifier(
+        compatible_path,
+        "beats",
+        current_metadata,
+        1,
+        0.15,
+        "cosine",
+        0.5,
+        2.0,
+        None,
+        None,
+    )
+    assert restored.metadata["feature_window"] == current_metadata["feature_window"]
+    assert restored.metadata["energy_threshold"] == 0.015

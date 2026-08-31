@@ -81,18 +81,23 @@ which prevents table ringing and threshold chatter from inflating the count.
 
 At the prompt, enter `register desk`. Each threshold-triggered capture window is
 one registration example, even if energy detection finds multiple knocks inside
-that window. By default, registration retains the original waveform and adds
+that window. Tap counting still examines the complete capture, but BEATs refines
+the first threshold-qualified onset and extracts features from a fixed 580 ms
+window beginning 200 ms before it and retaining 380 ms afterward. Later knocks
+therefore do not alter the surface embedding. By default, registration retains
+that onset-aligned waveform and adds
 peak-safe `-9 dB` and `+6 dB` variants before feature extraction, so one physical
 capture stores three classifier exemplars while advancing registration progress
 once. Repeat `--gain-db VALUE` to select different gains, or use
 `--no-gain-augmentation` to retain only originals. Gain augmentation never runs
 during live inference or tap counting. BEATs registrations are saved to
-`state/beats-registrations.npz` by default and loaded on the next startup. Enter
+`state/beats-onset200-registrations.npz` by default and loaded on the next startup. Enter
 `delete desk` to remove that class and all of
 its examples; deleting the final class also removes the empty state file. Enter
 `list` to show every registered label's physical-capture and exemplar counts.
 Enter `quit` or press Ctrl-C for a graceful shutdown.
-Mean-pooled BEATs embeddings use L2 normalization and cosine distance with a
+BEATs still mean-pools encoder tokens inside the shortened first-impact window.
+Its embeddings use L2 normalization and cosine distance with a
 provisional global ceiling of `0.15`; prefer the offline evaluator's calibrated
 value when representative validation data is available. Each class becomes
 eligible after three independent physical captures and is represented by its
@@ -139,7 +144,7 @@ automatically.
 Each feature extractor has an independent default state file, so switching
 models never silently reuses incompatible registrations:
 
-- BEATs: `state/beats-registrations.npz`
+- BEATs: `state/beats-onset200-registrations.npz`
 - PANN: `state/registrations.npz`
 - Legacy: `state/legacy-registrations.npz`
 
@@ -168,7 +173,10 @@ validation split. It then reports known-label classification, unknown rejection,
 and known-class probability negative log-likelihood on the test split. A label
 absent from the training split is treated as unknown. These metrics describe only
 the supplied manifest; the repository does not ship a dataset or claim model
-quality. The evaluator applies the same default `-9 dB` and peak-safe `+6 dB`
+quality. For BEATs, the evaluator applies the same onset-aligned 580 ms feature
+window as live capture. Its `--energy-threshold` defaults to `0.015`; use the same
+value used during representative live capture. The evaluator applies the same
+default `-9 dB` and peak-safe `+6 dB`
 variants only to training recordings; validation and test recordings remain
 unaltered. Use repeated `--gain-db VALUE` options to customize the recipe or
 `--no-gain-augmentation` to disable it.
@@ -203,3 +211,10 @@ absent. Tests never download models, use a microphone, or call external services
   or move/remove the old state file. Old files are left unchanged.
 - **Existing PANN registrations:** start with `--model pann`; BEATs cannot reuse
   embeddings created by another encoder.
+- **Older full-window BEATs registrations:** they remain untouched at
+  `state/beats-registrations.npz`. Re-register into the onset-aligned default
+  state; explicitly selecting the old file is rejected because its embeddings
+  use an incompatible feature window.
+- **Older 20 ms pre-onset BEATs registrations:** they remain untouched at
+  `state/beats-onset-registrations.npz`. The 200 ms pre-onset window uses a new
+  default state because the resulting embeddings are incompatible.

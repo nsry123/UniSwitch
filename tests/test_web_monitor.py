@@ -21,8 +21,21 @@ def test_monitor_publishes_audio_snapshot() -> None:
     assert snapshot["capturing"] is True
     assert snapshot["active"] is True
     assert snapshot["waveform"] == [-0.25, 0.5]
+    assert snapshot["featureWindow"] is None
     assert snapshot["lastResult"] is None
     assert snapshot["calibration"]["state"] == "needs_data"
+
+
+def test_monitor_publishes_feature_window() -> None:
+    monitor = MicrophoneMonitor(threshold=0.015, sample_rate=16000)
+
+    monitor.publish_feature_window(10.5, 10.8125, 16.75)
+
+    assert monitor.snapshot()["featureWindow"] == {
+        "startSequence": 10.5,
+        "onsetSequence": 10.8125,
+        "endSequence": 16.75,
+    }
 
 
 def test_monitor_publishes_calibration_and_unknown_capture() -> None:
@@ -77,5 +90,7 @@ def test_monitor_serves_dashboard_and_audio_api() -> None:
     assert "Microphone monitor" in page
     assert "Latest knock" in page
     assert "Interactive calibration" in page
+    assert "BEATs feature window" in page
+    assert "200 ms before" in page
     assert state["threshold"] == 0.01
     assert state["sampleRate"] == 16000

@@ -18,6 +18,7 @@ AugmentedAudioCallback = Callable[[np.ndarray, int, tuple[np.ndarray, ...]], obj
 ErrorCallback = Callable[[Exception], object]
 FrameCallback = Callable[[np.ndarray, float, bool], object]
 AugmentationPredicate = Callable[[], bool]
+FeatureWindowCallback = Callable[[float, float, float], object]
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class CapturedAudio:
 
     waveform: np.ndarray
     trigger_sample: int
+    trigger_frame: int | None = None
 
 
 class AudioProcessor(Protocol):
@@ -38,6 +40,20 @@ class AudioProcessor(Protocol):
     def count_taps(
         self, audio_clip: np.ndarray, energy_threshold: float = 0.015
     ) -> int: ...
+
+    def prepare_feature_audio(
+        self,
+        audio_clip: np.ndarray,
+        trigger_sample: int,
+        energy_threshold: float = 0.015,
+    ) -> np.ndarray: ...
+
+    def feature_window_bounds(
+        self,
+        audio_clip: np.ndarray,
+        trigger_sample: int,
+        energy_threshold: float = 0.015,
+    ) -> tuple[int, int, int] | None: ...
 
     def extract_features(self, audio_clip: np.ndarray) -> np.ndarray: ...
 
@@ -58,14 +74,16 @@ class AudioListener:
         processor: AudioProcessor,
         device_index: int | None = None,
         threshold: float = 0.015,
-        pre_roll_sec: float = 0.2,
+        pre_roll_sec: float = 0.32,
         record_sec: float = 1.5,
         frame_callback: FrameCallback | None = None,
     ) -> None:
         """
         Initializes the microphone stream.
         - threshold:     RMS energy level required to trigger a capture.
-        - pre_roll_sec:  Audio kept *before* the trigger (captures the attack transient).
+        - pre_roll_sec:  Ring-buffer capacity including the trigger chunk. The
+                         0.32 s default guarantees at least 0.20 s of audio
+                         before an onset anywhere in the trigger chunk.
         - record_sec:    Audio recorded *after* the trigger. Set to 1.5 s to
                          reliably capture slow triple-knocks.
 
@@ -123,6 +141,7 @@ class AudioListener:
         augmented_trigger_callback: AugmentedAudioCallback | None = None,
         should_augment: AugmentationPredicate | None = None,
         gain_db_values: tuple[float, ...] = (),
+        feature_window_callback: FeatureWindowCallback | None = None,
     ) -> None:
         """
         Opens the mic and starts two threads:
@@ -158,6 +177,7 @@ class AudioListener:
                     augmented_trigger_callback,
                     should_augment,
                     validated_gains,
+                    feature_window_callback,
                 ),
                 daemon=True,
             )
@@ -192,7 +212,10 @@ class AudioListener:
             )
 
             tap_count = self.processor.count_taps(y_trimmed, self.threshold)
-            features = self.processor.extract_features(y_trimmed)
+            feature_audio = self.processor.prepare_feature_audio(
+                y_trimmed, 0, self.threshold
+            )
+            features = self.processor.extract_features(feature_audio)
 
             print(f"[*] Taps detected: {tap_count}")
             print(f"[*] Feature vector length: {len(features)}")
@@ -228,9 +251,12 @@ class AudioListener:
         post_trigger: list[np.ndarray] = []  # staging list for post-trigger chunks
         pre_roll_snapshot: list[np.ndarray] = []  # frozen ring buffer at trigger
         remaining_chunks = 0
+        frame_sequence = 0
+        trigger_frame: int | None = None
 
         while not self._stop_event.is_set():
             data = stream.read(self.chunk_size, exception_on_overflow=False)
+            frame_sequence += 1
             audio_frame = np.frombuffer(data, dtype=np.float32)
             energy = self.processor.calculate_energy(audio_frame)
 
@@ -245,6 +271,7 @@ class AudioListener:
                     pre_roll_snapshot = list(self.buffer)
                     post_trigger = []
                     remaining_chunks = self.record_chunks
+                    trigger_frame = frame_sequence
                     capturing = True
 
             else:
@@ -260,7 +287,9 @@ class AudioListener:
                     trigger_sample = sum(
                         frame.size for frame in pre_roll_snapshot[:-1]
                     )
-                    self._capture_queue.put(CapturedAudio(full_clip, trigger_sample))
+                    self._capture_queue.put(
+                        CapturedAudio(full_clip, trigger_sample, trigger_frame)
+                    )
 
                     # Seed the ring buffer with the tail of the just-captured
                     # window so the next event's pre-roll is meaningful.
@@ -288,6 +317,7 @@ class AudioListener:
         augmented_trigger_callback: AugmentedAudioCallback | None = None,
         should_augment: AugmentationPredicate | None = None,
         gain_db_values: tuple[float, ...] = (),
+        feature_window_callback: FeatureWindowCallback | None = None,
     ) -> None:
         """
         Runs on a background daemon thread. Dequeues complete audio clips
@@ -297,7 +327,8 @@ class AudioListener:
         The worker never calls stream.read(). Its only input is the queue of
         finished captures, making it trivially thread-safe with respect to
         audio capture. Knock counting starts at the trigger chunk, while feature
-        extraction retains the full pre-roll waveform.
+        preprocessing receives the full waveform and applies the selected
+        extractor's input-window contract.
         """
         while not self._stop_event.is_set():
             try:
@@ -308,7 +339,28 @@ class AudioListener:
             try:
                 count_waveform = capture.waveform[capture.trigger_sample :]
                 tap_count = self.processor.count_taps(count_waveform, self.threshold)
-                features = self.processor.extract_features(capture.waveform)
+                feature_audio = self.processor.prepare_feature_audio(
+                    capture.waveform,
+                    capture.trigger_sample,
+                    self.threshold,
+                )
+                if feature_window_callback is not None and capture.trigger_frame is not None:
+                    bounds = self.processor.feature_window_bounds(
+                        capture.waveform,
+                        capture.trigger_sample,
+                        self.threshold,
+                    )
+                    if bounds is not None:
+                        start_sample, onset_sample, end_sample = bounds
+                        feature_window_callback(
+                            capture.trigger_frame
+                            + (start_sample - capture.trigger_sample) / self.chunk_size,
+                            capture.trigger_frame
+                            + (onset_sample - capture.trigger_sample) / self.chunk_size,
+                            capture.trigger_frame
+                            + (end_sample - capture.trigger_sample) / self.chunk_size,
+                        )
+                features = self.processor.extract_features(feature_audio)
                 augment_capture = (
                     augmented_trigger_callback is not None
                     and should_augment is not None
@@ -319,7 +371,7 @@ class AudioListener:
                     assert augmented_trigger_callback is not None
                     augmented_features = tuple(
                         self.processor.extract_features(
-                            apply_gain_db(capture.waveform, gain_db)
+                            apply_gain_db(feature_audio, gain_db)
                         )
                         for gain_db in gain_db_values
                     )

@@ -13,6 +13,9 @@ BEATS_CHECKPOINT_PATH: Final = Path("models/BEATs_iter3_plus_AS2M.pt")
 BEATS_SOURCE_REVISION: Final = "833df7e7832e5064a281131ee64a481afa8e5b95"
 BEATS_EMBEDDING_DIM: Final = 768
 BEATS_POOLING: Final = "mean"
+BEATS_FEATURE_ALIGNMENT: Final = "first_threshold_onset"
+BEATS_FEATURE_WINDOW_SECONDS: Final = 0.580
+BEATS_PRE_ONSET_SECONDS: Final = 0.200
 DEFAULT_ENERGY_THRESHOLD: Final = 0.015
 KNOCK_RMS_FRAME_SECONDS: Final = 0.020
 KNOCK_RMS_HOP_SECONDS: Final = 0.010
@@ -109,6 +112,79 @@ class SignalProcessor:
         if not np.isfinite(waveform).all():
             raise ValueError("audio_frame contains NaN or infinite samples")
         return float(np.sqrt(np.mean(waveform.astype(np.float64) ** 2)))
+
+    def prepare_feature_audio(
+        self,
+        audio_clip: np.ndarray,
+        trigger_sample: int,
+        energy_threshold: float = DEFAULT_ENERGY_THRESHOLD,
+    ) -> np.ndarray:
+        """Return audio shaped for the selected feature extractor.
+
+        BEATs receives a fixed first-impact window so its temporal mean pool is
+        not dominated by the remainder of the capture. ``trigger_sample`` is
+        the coarse start of the stream chunk that opened the live energy gate;
+        the onset is refined from there with the same RMS framing used for tap
+        counting. Other extractors retain their historical full-clip input.
+        """
+        waveform = self._validate_audio(audio_clip)
+        bounds = self.feature_window_bounds(waveform, trigger_sample, energy_threshold)
+        if bounds is None:
+            return waveform
+        source_start, _, source_end = bounds
+
+        window_samples = round(BEATS_FEATURE_WINDOW_SECONDS * self.sample_rate)
+        copy_start = max(0, source_start)
+        copy_end = min(waveform.size, source_end)
+        destination_start = copy_start - source_start
+
+        prepared = np.zeros(window_samples, dtype=np.float32)
+        prepared[destination_start : destination_start + copy_end - copy_start] = waveform[
+            copy_start:copy_end
+        ]
+        return prepared
+
+    def feature_window_bounds(
+        self,
+        audio_clip: np.ndarray,
+        trigger_sample: int,
+        energy_threshold: float = DEFAULT_ENERGY_THRESHOLD,
+    ) -> tuple[int, int, int] | None:
+        """Return nominal ``(start, onset, end)`` samples for feature input.
+
+        Bounds may extend beyond the waveform where zero-padding is part of the
+        BEATs input. Other extractors return ``None`` because they consume the
+        complete capture.
+        """
+        waveform = self._validate_audio(audio_clip)
+        if self.model != "beats":
+            return None
+        if not isinstance(trigger_sample, (int, np.integer)):
+            raise TypeError("trigger_sample must be an integer sample index")
+        if trigger_sample < 0 or trigger_sample >= waveform.size:
+            raise ValueError(
+                f"trigger_sample must be within the waveform, got {trigger_sample}"
+            )
+        if not np.isfinite(energy_threshold) or energy_threshold < 0:
+            raise ValueError("energy_threshold must be finite and non-negative")
+
+        frame_length = max(1, round(KNOCK_RMS_FRAME_SECONDS * self.sample_rate))
+        hop_length = max(1, round(KNOCK_RMS_HOP_SECONDS * self.sample_rate))
+        search_waveform = waveform[int(trigger_sample) :]
+        energy = self._rms_envelope(search_waveform, frame_length, hop_length)
+        crossings = np.flatnonzero(energy > energy_threshold)
+        if crossings.size == 0:
+            raise ValueError(
+                "no threshold-qualified onset found at or after trigger_sample; "
+                "check the capture or energy threshold"
+            )
+
+        onset_sample = int(trigger_sample) + int(crossings[0]) * hop_length
+        window_samples = round(BEATS_FEATURE_WINDOW_SECONDS * self.sample_rate)
+        pre_onset_samples = round(BEATS_PRE_ONSET_SECONDS * self.sample_rate)
+        source_start = onset_sample - pre_onset_samples
+        source_end = source_start + window_samples
+        return source_start, onset_sample, source_end
 
     # ------------------------------------------------------------------ #
     #  Knock counting                                                      #

@@ -19,8 +19,12 @@ from src.audio.augmentation import (
 from src.audio.processor import (
     BEATS_CHECKPOINT_PATH,
     BEATS_EMBEDDING_DIM,
+    BEATS_FEATURE_ALIGNMENT,
+    BEATS_FEATURE_WINDOW_SECONDS,
     BEATS_POOLING,
+    BEATS_PRE_ONSET_SECONDS,
     BEATS_SOURCE_REVISION,
+    DEFAULT_ENERGY_THRESHOLD,
     PANN_CHECKPOINT_PATH,
     SignalProcessor,
 )
@@ -33,6 +37,7 @@ def extract_split(
     split: str,
     processor: SignalProcessor,
     gain_db_values: tuple[float, ...] = (),
+    energy_threshold: float = DEFAULT_ENERGY_THRESHOLD,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract deterministic features for one manifest split."""
     vectors: list[np.ndarray] = []
@@ -55,10 +60,11 @@ def extract_split(
         trimmed, _ = librosa.effects.trim(waveform, top_db=20)
         if trimmed.size == 0:
             raise ValueError(f"audio is empty after trimming: {record.path}")
-        vectors.append(processor.extract_features(trimmed))
+        feature_audio = processor.prepare_feature_audio(trimmed, 0, energy_threshold)
+        vectors.append(processor.extract_features(feature_audio))
         labels.append(record.label)
         for gain_db in gain_db_values:
-            vectors.append(processor.extract_features(apply_gain_db(trimmed, gain_db)))
+            vectors.append(processor.extract_features(apply_gain_db(feature_audio, gain_db)))
             labels.append(record.label)
     return np.vstack(vectors), np.asarray(labels, dtype=np.str_)
 
@@ -86,6 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--skip-checkpoint-verification", action="store_true")
     parser.add_argument("--neighbors", type=int, nargs="+", default=[1, 3, 5, 7])
+    parser.add_argument("--energy-threshold", type=float, default=DEFAULT_ENERGY_THRESHOLD)
     parser.add_argument("--save-model", type=Path)
     gain_group = parser.add_mutually_exclusive_group()
     gain_group.add_argument(
@@ -121,9 +128,20 @@ def main(arguments: argparse.Namespace) -> int:
         "train",
         processor,
         gain_db_values,
+        arguments.energy_threshold,
     )
-    validation_features, validation_labels = extract_split(records, "validation", processor)
-    test_features, test_labels = extract_split(records, "test", processor)
+    validation_features, validation_labels = extract_split(
+        records,
+        "validation",
+        processor,
+        energy_threshold=arguments.energy_threshold,
+    )
+    test_features, test_labels = extract_split(
+        records,
+        "test",
+        processor,
+        energy_threshold=arguments.energy_threshold,
+    )
     classifier, calibration = calibrate_classifier(
         train_features,
         train_labels,
@@ -157,6 +175,12 @@ def main(arguments: argparse.Namespace) -> int:
                     "embedding_dim": BEATS_EMBEDDING_DIM,
                     "pooling": BEATS_POOLING,
                     "source_revision": BEATS_SOURCE_REVISION,
+                    "feature_window": {
+                        "alignment": BEATS_FEATURE_ALIGNMENT,
+                        "duration_seconds": BEATS_FEATURE_WINDOW_SECONDS,
+                        "pre_onset_seconds": BEATS_PRE_ONSET_SECONDS,
+                    },
+                    "energy_threshold": arguments.energy_threshold,
                 }
             )
         classifier.save(

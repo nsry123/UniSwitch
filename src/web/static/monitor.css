@@ -95,6 +95,8 @@ h2 { margin-bottom: 0; font-size: 1.25rem; letter-spacing: -0.02em; }
 .legend { gap: 8px; color: var(--muted); font-size: 0.78rem; }
 .legend span { width: 22px; height: 2px; background: var(--amber); }
 .legend b { color: var(--amber); font-variant-numeric: tabular-nums; }
+.chart-legends { display: flex; align-items: flex-end; flex-direction: column; gap: 7px; }
+.feature-legend span { height: 8px; background: rgba(80, 150, 255, 0.35); }
 .chart-wrap { height: 330px; }
 .wave-wrap { height: 140px; }
 canvas { display: block; width: 100%; height: 100%; }
