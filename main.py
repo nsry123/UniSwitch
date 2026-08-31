@@ -23,13 +23,14 @@ from src.audio.processor import (
     BEATS_SOURCE_REVISION,
     PANN_CHECKPOINT_PATH,
     SignalProcessor,
+    beats_input_normalization_metadata,
 )
 from src.controller import SwitchController
 from src.ml.classifier import DistanceMode, TapClassifier
 from src.web.app import MicrophoneMonitor
 
 DEFAULT_STATE_PATHS = {
-    "beats": Path("state/beats-onset200-registrations.npz"),
+    "beats": Path("state/beats-onset200-normalized-registrations.npz"),
     "pann": Path("state/registrations.npz"),
     "legacy": Path("state/legacy-registrations.npz"),
 }
@@ -50,6 +51,13 @@ def gain_db_argument(value: str) -> float:
 
 def resolve_gain_db(arguments: argparse.Namespace) -> tuple[float, ...]:
     """Resolve default, custom, or disabled gain augmentation settings."""
+    if arguments.model == "beats":
+        if arguments.gain_db is not None:
+            raise ValueError(
+                "--gain-db is not supported for BEATs because input normalization "
+                "already removes scalar gain"
+            )
+        return ()
     if arguments.no_gain_augmentation:
         return ()
     requested = arguments.gain_db
@@ -131,8 +139,15 @@ def load_or_create_classifier(
             "source_revision",
             "feature_window",
             "energy_threshold",
+            "input_normalization",
         ):
             if classifier.metadata.get(key) != extractor_metadata.get(key):
+                if key == "input_normalization":
+                    raise ValueError(
+                        "state file BEATs input_normalization differs from the selected "
+                        "encoder; re-register with normalized BEATs features or select "
+                        "a compatible state file"
+                    )
                 raise ValueError(
                     f"state file BEATs {key} differs from the selected encoder; "
                     "re-register using the onset-aligned default state path or "
@@ -149,6 +164,7 @@ def load_or_create_classifier(
 
 def run_application(arguments: argparse.Namespace) -> int:
     """Start capture and serve the interactive command loop."""
+    gain_db_values = resolve_gain_db(arguments)
     checkpoint_path = resolve_checkpoint_path(arguments.model, arguments.checkpoint)
     processor = SignalProcessor(
         model=arguments.model,
@@ -168,7 +184,6 @@ def run_application(arguments: argparse.Namespace) -> int:
     threshold = arguments.distance_threshold
     if threshold is None:
         threshold = DEFAULT_DISTANCE_THRESHOLDS[arguments.model]
-    gain_db_values = resolve_gain_db(arguments)
     metadata = {
         "feature_extractor": arguments.model,
         "checkpoint_sha256": checkpoint_sha256,
@@ -190,6 +205,7 @@ def run_application(arguments: argparse.Namespace) -> int:
                     "pre_onset_seconds": BEATS_PRE_ONSET_SECONDS,
                 },
                 "energy_threshold": arguments.energy_threshold,
+                "input_normalization": beats_input_normalization_metadata(),
             }
         )
     classifier = load_or_create_classifier(
@@ -398,7 +414,10 @@ def parse_args() -> argparse.Namespace:
         "--gain-db",
         action="append",
         type=gain_db_argument,
-        help="gain in dB to add per registration; repeat for multiple values",
+        help=(
+            "gain in dB to add per PANN/legacy registration; repeat for multiple "
+            "values (unsupported for BEATs)"
+        ),
     )
     gain_group.add_argument("--no-gain-augmentation", action="store_true")
     parser.add_argument("--monitor-port", type=int, default=8765)

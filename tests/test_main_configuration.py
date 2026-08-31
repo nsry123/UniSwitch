@@ -5,7 +5,6 @@ import pytest
 
 from main import (
     DEFAULT_DISTANCE_THRESHOLDS,
-    DEFAULT_GAIN_DB,
     load_or_create_classifier,
     parse_args,
     resolve_checkpoint_path,
@@ -26,24 +25,40 @@ def test_beats_is_cli_default(monkeypatch) -> None:
     assert arguments.checkpoint is None
     assert arguments.state_path is None
     assert DEFAULT_DISTANCE_THRESHOLDS["beats"] == 0.15
-    assert resolve_gain_db(arguments) == DEFAULT_GAIN_DB
+    assert resolve_gain_db(arguments) == ()
 
 
 def test_gain_cli_accepts_custom_values_and_disable(monkeypatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["main.py", "--gain-db", "-3", "--gain-db", "4"])
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["main.py", "--model", "pann", "--gain-db", "-3", "--gain-db", "4"],
+    )
     custom = parse_args()
     assert resolve_gain_db(custom) == (-3.0, 4.0)
 
-    monkeypatch.setattr(sys, "argv", ["main.py", "--no-gain-augmentation"])
+    monkeypatch.setattr(
+        sys, "argv", ["main.py", "--model", "legacy", "--no-gain-augmentation"]
+    )
     disabled = parse_args()
     assert resolve_gain_db(disabled) == ()
+
+
+def test_beats_rejects_explicit_gain_augmentation(monkeypatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["main.py", "--gain-db", "-6"])
+
+    with pytest.raises(ValueError, match="not supported for BEATs"):
+        resolve_gain_db(parse_args())
 
 
 def test_model_specific_checkpoint_and_state_paths() -> None:
     assert resolve_checkpoint_path("beats", None) == BEATS_CHECKPOINT_PATH
     assert resolve_checkpoint_path("pann", None) == PANN_CHECKPOINT_PATH
     assert resolve_checkpoint_path("legacy", None) is None
-    assert resolve_state_path("beats", None).name == "beats-onset200-registrations.npz"
+    assert (
+        resolve_state_path("beats", None).name
+        == "beats-onset200-normalized-registrations.npz"
+    )
     assert resolve_state_path("pann", None).name == "registrations.npz"
     assert resolve_state_path("legacy", None).name == "legacy-registrations.npz"
 
@@ -221,3 +236,38 @@ def test_beats_state_rejects_missing_onset_window_contract(tmp_path) -> None:
     )
     assert restored.metadata["feature_window"] == current_metadata["feature_window"]
     assert restored.metadata["energy_threshold"] == 0.015
+
+
+def test_beats_state_rejects_missing_normalization_contract(tmp_path) -> None:
+    state_path = tmp_path / "unnormalized-beats.npz"
+    classifier = TapClassifier(n_neighbors=1, distance_threshold=0.15, distance_mode="cosine")
+    classifier.register_tap(np.array([1.0, 0.0]), "desk")
+    metadata = {
+        "feature_extractor": "beats",
+        "checkpoint_sha256": "beats-sha",
+        "sample_rate": 16000,
+        "embedding_dim": 768,
+        "pooling": "mean",
+        "source_revision": "revision",
+        "feature_window": {
+            "alignment": "first_threshold_onset",
+            "duration_seconds": 0.58,
+            "pre_onset_seconds": 0.2,
+        },
+        "energy_threshold": 0.015,
+    }
+    classifier.save(state_path, metadata)
+
+    with pytest.raises(ValueError, match="re-register with normalized BEATs"):
+        load_or_create_classifier(
+            state_path,
+            "beats",
+            {**metadata, "input_normalization": {"version": "test-v1"}},
+            1,
+            0.15,
+            "cosine",
+            0.5,
+            2.0,
+            None,
+            None,
+        )

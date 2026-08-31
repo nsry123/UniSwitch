@@ -16,12 +16,37 @@ BEATS_POOLING: Final = "mean"
 BEATS_FEATURE_ALIGNMENT: Final = "first_threshold_onset"
 BEATS_FEATURE_WINDOW_SECONDS: Final = 0.580
 BEATS_PRE_ONSET_SECONDS: Final = 0.200
+BEATS_NORMALIZATION_VERSION: Final = "rms01-fbank-global-v1"
+BEATS_TARGET_RMS: Final = 0.1
+BEATS_PEAK_CEILING: Final = 1.0
+BEATS_SILENCE_EPSILON: Final = 1e-8
+BEATS_FBANK_NORMALIZATION: Final = "per_window_global_mean_std"
+BEATS_FBANK_EPSILON: Final = 1e-5
+BEATS_FBANK_STD_SCALE: Final = 2.0
 DEFAULT_ENERGY_THRESHOLD: Final = 0.015
 KNOCK_RMS_FRAME_SECONDS: Final = 0.020
 KNOCK_RMS_HOP_SECONDS: Final = 0.010
 KNOCK_RELEASE_RATIO: Final = 0.7
 KNOCK_RELEASE_SECONDS: Final = 0.060
 MIN_KNOCK_INTERVAL_SECONDS: Final = 0.120
+
+
+def beats_input_normalization_metadata() -> dict[str, object]:
+    """Return the persisted, versioned BEATs input-normalization contract."""
+    return {
+        "version": BEATS_NORMALIZATION_VERSION,
+        "waveform": {
+            "mode": "rms",
+            "target_rms": BEATS_TARGET_RMS,
+            "peak_ceiling": BEATS_PEAK_CEILING,
+            "silence_epsilon": BEATS_SILENCE_EPSILON,
+        },
+        "fbank": {
+            "mode": BEATS_FBANK_NORMALIZATION,
+            "std_scale": BEATS_FBANK_STD_SCALE,
+            "epsilon": BEATS_FBANK_EPSILON,
+        },
+    }
 
 
 class SignalProcessor:
@@ -270,6 +295,16 @@ class SignalProcessor:
             return self.extract_features_pann(audio_clip=waveform)
         return self.extract_features_default(audio_clip=waveform)
 
+    def normalize_beats_waveform(self, audio_clip: np.ndarray) -> np.ndarray:
+        """Return a peak-safe, fixed-RMS waveform for BEATs feature extraction."""
+        waveform = self._validate_audio(audio_clip)
+        rms = float(np.sqrt(np.mean(waveform.astype(np.float64) ** 2)))
+        if rms <= BEATS_SILENCE_EPSILON:
+            raise ValueError("BEATs waveform is effectively silent")
+        peak = float(np.max(np.abs(waveform)))
+        scale = min(BEATS_TARGET_RMS / rms, BEATS_PEAK_CEILING / peak)
+        return np.multiply(waveform, scale, dtype=np.float32)
+
     def extract_features_default(self, audio_clip: np.ndarray) -> np.ndarray:
         """
         Compresses a 1.5-second audio array into a flat, 1D feature vector
@@ -401,7 +436,7 @@ class SignalProcessor:
         """Return a mean-pooled 768-D representation from the frozen BEATs encoder."""
         import torch
 
-        waveform_array = self._validate_audio(audio_clip)
+        waveform_array = self.normalize_beats_waveform(audio_clip)
         if self._beats_model is None:
             assert self.checkpoint_path is not None
             self._load_beats(str(self.checkpoint_path))
@@ -410,7 +445,9 @@ class SignalProcessor:
         with torch.inference_mode():
             # The official Kaldi-compatible frontend runs on CPU. Only the compact
             # filterbank representation is moved to the selected accelerator.
-            fbank = self._beats_model.preprocess(waveform).unsqueeze(1)
+            fbank = self._beats_model.preprocess_per_window(
+                waveform, BEATS_FBANK_EPSILON
+            ).unsqueeze(1)
             features = self._beats_model.patch_embedding(fbank.to(self._beats_device))
             features = features.reshape(features.shape[0], features.shape[1], -1)
             features = features.transpose(1, 2)

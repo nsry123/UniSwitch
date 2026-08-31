@@ -27,6 +27,7 @@ from src.audio.processor import (
     DEFAULT_ENERGY_THRESHOLD,
     PANN_CHECKPOINT_PATH,
     SignalProcessor,
+    beats_input_normalization_metadata,
 )
 from src.ml.dataset import AudioRecord, load_manifest
 from src.ml.evaluation import calibrate_classifier, evaluate_classifier
@@ -79,6 +80,13 @@ def gain_db_argument(value: str) -> float:
 
 def resolve_gain_db(arguments: argparse.Namespace) -> tuple[float, ...]:
     """Resolve default, custom, or disabled gain augmentation settings."""
+    if arguments.model == "beats":
+        if arguments.gain_db is not None:
+            raise ValueError(
+                "--gain-db is not supported for BEATs because input normalization "
+                "already removes scalar gain"
+            )
+        return ()
     if arguments.no_gain_augmentation:
         return ()
     requested = arguments.gain_db
@@ -99,7 +107,10 @@ def parse_args() -> argparse.Namespace:
         "--gain-db",
         action="append",
         type=gain_db_argument,
-        help="gain in dB to add as a training variant; repeat for multiple values",
+        help=(
+            "gain in dB to add as a PANN/legacy training variant; repeat for "
+            "multiple values (unsupported for BEATs)"
+        ),
     )
     gain_group.add_argument("--no-gain-augmentation", action="store_true")
     return parser.parse_args()
@@ -107,6 +118,7 @@ def parse_args() -> argparse.Namespace:
 
 def main(arguments: argparse.Namespace) -> int:
     records = load_manifest(arguments.manifest)
+    gain_db_values = resolve_gain_db(arguments)
     checkpoint_path = arguments.checkpoint
     if checkpoint_path is None:
         checkpoint_path = {
@@ -122,7 +134,6 @@ def main(arguments: argparse.Namespace) -> int:
     if arguments.model in {"beats", "pann"}:
         checkpoint_sha256 = processor.prepare()
 
-    gain_db_values = resolve_gain_db(arguments)
     train_features, train_labels = extract_split(
         records,
         "train",
@@ -181,6 +192,7 @@ def main(arguments: argparse.Namespace) -> int:
                         "pre_onset_seconds": BEATS_PRE_ONSET_SECONDS,
                     },
                     "energy_threshold": arguments.energy_threshold,
+                    "input_normalization": beats_input_normalization_metadata(),
                 }
             )
         classifier.save(

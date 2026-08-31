@@ -84,14 +84,18 @@ one registration example, even if energy detection finds multiple knocks inside
 that window. Tap counting still examines the complete capture, but BEATs refines
 the first threshold-qualified onset and extracts features from a fixed 580 ms
 window beginning 200 ms before it and retaining 380 ms afterward. Later knocks
-therefore do not alter the surface embedding. By default, registration retains
-that onset-aligned waveform and adds
-peak-safe `-9 dB` and `+6 dB` variants before feature extraction, so one physical
-capture stores three classifier exemplars while advancing registration progress
-once. Repeat `--gain-db VALUE` to select different gains, or use
-`--no-gain-augmentation` to retain only originals. Gain augmentation never runs
-during live inference or tap counting. BEATs registrations are saved to
-`state/beats-onset200-registrations.npz` by default and loaded on the next startup. Enter
+therefore do not alter the surface embedding. Immediately before BEATs feature
+extraction, the fixed window is normalized to `0.1` RMS with a peak ceiling of
+`1.0`. Its Kaldi filterbank is then normalized with the window's own global mean
+and standard deviation instead of BEATs' corpus-wide constants. This always-on
+recipe removes scalar strike force without changing the raw waveform used for
+triggering, tap counting, or the monitor. Gain augmentation is disabled for
+BEATs, and passing `--gain-db` with `--model beats` is an error. PANN and legacy
+registration retain the default peak-safe `-9 dB` and `+6 dB` variants; use
+repeated `--gain-db VALUE` options to customize them or
+`--no-gain-augmentation` to disable them. BEATs registrations are saved to
+`state/beats-onset200-normalized-registrations.npz` by default. Older BEATs
+registrations are incompatible and must be collected again. Enter
 `delete desk` to remove that class and all of
 its examples; deleting the final class also removes the empty state file. Enter
 `list` to show every registered label's physical-capture and exemplar counts.
@@ -174,11 +178,13 @@ and known-class probability negative log-likelihood on the test split. A label
 absent from the training split is treated as unknown. These metrics describe only
 the supplied manifest; the repository does not ship a dataset or claim model
 quality. For BEATs, the evaluator applies the same onset-aligned 580 ms feature
-window as live capture. Its `--energy-threshold` defaults to `0.015`; use the same
-value used during representative live capture. The evaluator applies the same
-default `-9 dB` and peak-safe `+6 dB`
-variants only to training recordings; validation and test recordings remain
-unaltered. Use repeated `--gain-db VALUE` options to customize the recipe or
+window and always-on waveform/filterbank normalization as live capture. Its
+`--energy-threshold` defaults to `0.015`; use the same value used during
+representative live capture. BEATs gain augmentation is disabled because its
+variants collapse under normalization. For PANN and legacy, the evaluator still
+applies the default `-9 dB` and peak-safe `+6 dB` variants only to training
+recordings; validation and test recordings remain unaltered. Use repeated
+`--gain-db VALUE` options to customize that recipe or
 `--no-gain-augmentation` to disable it.
 
 ## Development checks

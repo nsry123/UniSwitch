@@ -5,8 +5,11 @@ from src.audio.processor import (
     BEATS_CHECKPOINT_PATH,
     BEATS_EMBEDDING_DIM,
     BEATS_FEATURE_WINDOW_SECONDS,
+    BEATS_PEAK_CEILING,
     BEATS_PRE_ONSET_SECONDS,
+    BEATS_TARGET_RMS,
     SignalProcessor,
+    beats_input_normalization_metadata,
 )
 
 
@@ -200,6 +203,68 @@ def test_beats_is_default_and_uses_16khz() -> None:
     assert SignalProcessor(model="default").model == "beats"
 
 
+def test_beats_normalization_metadata_describes_public_contract() -> None:
+    metadata = beats_input_normalization_metadata()
+
+    assert metadata["version"] == "rms01-fbank-global-v1"
+    assert metadata["waveform"] == {
+        "mode": "rms",
+        "target_rms": 0.1,
+        "peak_ceiling": 1.0,
+        "silence_epsilon": 1e-8,
+    }
+    assert metadata["fbank"] == {
+        "mode": "per_window_global_mean_std",
+        "std_scale": 2.0,
+        "epsilon": 1e-5,
+    }
+
+
+def test_beats_waveform_normalization_reaches_target_without_mutation() -> None:
+    processor = SignalProcessor(model="beats")
+    waveform = np.linspace(-0.1, 0.1, 4096, dtype=np.float32)
+    original = waveform.copy()
+
+    normalized = processor.normalize_beats_waveform(waveform)
+
+    assert normalized.shape == waveform.shape
+    assert normalized.dtype == np.float32
+    assert normalized is not waveform
+    np.testing.assert_array_equal(waveform, original)
+    assert np.sqrt(np.mean(normalized.astype(np.float64) ** 2)) == pytest.approx(
+        BEATS_TARGET_RMS
+    )
+
+
+def test_beats_waveform_normalization_limits_peak() -> None:
+    processor = SignalProcessor(model="beats")
+    waveform = np.full(4096, 0.001, dtype=np.float32)
+    waveform[0] = 1.0
+
+    normalized = processor.normalize_beats_waveform(waveform)
+
+    assert np.max(np.abs(normalized)) == pytest.approx(BEATS_PEAK_CEILING)
+    assert np.sqrt(np.mean(normalized.astype(np.float64) ** 2)) < BEATS_TARGET_RMS
+
+
+@pytest.mark.parametrize(
+    "waveform",
+    [
+        np.zeros(32, dtype=np.float32),
+        np.full(32, 1e-10, dtype=np.float32),
+        np.array([], dtype=np.float32),
+        np.zeros((2, 2), dtype=np.float32),
+        np.array([0.1, np.nan], dtype=np.float32),
+        np.array([0.1, np.inf], dtype=np.float32),
+    ],
+)
+def test_beats_waveform_normalization_rejects_invalid_or_silent_audio(
+    waveform: np.ndarray,
+) -> None:
+    with pytest.raises(ValueError):
+        SignalProcessor(model="beats").normalize_beats_waveform(waveform)
+
+
 def test_prepare_eagerly_loads_and_caches_beats(monkeypatch) -> None:
     processor = SignalProcessor(model="beats")
     load_calls: list[str] = []
@@ -260,8 +325,9 @@ def test_beats_extracts_deterministic_mean_pooled_embedding(monkeypatch) -> None
             self.dropout_input = torch.nn.Identity()
 
         @staticmethod
-        def preprocess(waveform):
-            return waveform[:, :16].reshape(1, 4, 4)
+        def preprocess_per_window(waveform, epsilon):
+            fbank = waveform[:, :16].reshape(1, 4, 4)
+            return (fbank - fbank.mean()) / (2 * fbank.std(unbiased=False).clamp_min(epsilon))
 
         @staticmethod
         def encoder(features):
@@ -282,3 +348,26 @@ def test_beats_extracts_deterministic_mean_pooled_embedding(monkeypatch) -> None
     assert first.shape == (BEATS_EMBEDDING_DIM,)
     assert np.isfinite(first).all()
     np.testing.assert_array_equal(first, second)
+
+
+def test_beats_frontend_uses_per_window_global_statistics(monkeypatch) -> None:
+    import torch
+
+    from src.audio.beats import BEATs
+
+    model = BEATs.__new__(BEATs)
+    torch.nn.Module.__init__(model)
+    raw = torch.tensor(
+        [
+            [[1.0, 2.0], [3.0, 4.0]],
+            [[10.0, 30.0], [50.0, 70.0]],
+        ]
+    )
+    monkeypatch.setattr(model, "raw_fbank", lambda _source: raw)
+
+    normalized = model.preprocess_per_window(torch.zeros((2, 8)), epsilon=1e-5)
+
+    torch.testing.assert_close(normalized.mean(dim=(1, 2)), torch.zeros(2))
+    torch.testing.assert_close(
+        normalized.std(dim=(1, 2), unbiased=False), torch.full((2,), 0.5)
+    )

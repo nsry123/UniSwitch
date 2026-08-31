@@ -121,14 +121,28 @@ class BEATs(nn.Module):
             fbank_mean: float = 15.41663,
             fbank_std: float = 6.55582,
     ) -> torch.Tensor:
+        fbank = self.raw_fbank(source)
+        return (fbank - fbank_mean) / (2 * fbank_std)
+
+    def raw_fbank(self, source: torch.Tensor) -> torch.Tensor:
+        """Return the unnormalized Kaldi filterbank for each input waveform."""
         fbanks = []
         for waveform in source:
             waveform = waveform.unsqueeze(0) * 2 ** 15
             fbank = ta_kaldi.fbank(waveform, num_mel_bins=128, sample_frequency=16000, frame_length=25, frame_shift=10)
             fbanks.append(fbank)
-        fbank = torch.stack(fbanks, dim=0)
-        fbank = (fbank - fbank_mean) / (2 * fbank_std)
-        return fbank
+        return torch.stack(fbanks, dim=0)
+
+    def preprocess_per_window(
+            self,
+            source: torch.Tensor,
+            epsilon: float,
+    ) -> torch.Tensor:
+        """Normalize each filterbank with its own global mean and deviation."""
+        fbank = self.raw_fbank(source)
+        mean = fbank.mean(dim=(1, 2), keepdim=True)
+        std = fbank.std(dim=(1, 2), unbiased=False, keepdim=True)
+        return (fbank - mean) / (2 * std.clamp_min(epsilon))
 
     def extract_features(
             self,
@@ -177,4 +191,3 @@ class BEATs(nn.Module):
             return lprobs, padding_mask
         else:
             return x, padding_mask
-
