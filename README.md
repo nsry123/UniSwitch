@@ -1,10 +1,11 @@
 # Universal Switch
 
-Universal Switch is a local prototype that learns user-defined labels for the
-surface or location of acoustic knocks, such as `desk` or `wall`. It also counts
-threshold-qualified knocks within each captured window. By default, a frozen
-Microsoft BEATs Iter3+ AS2M encoder creates 768-D audio embeddings and the local
-prototype/exemplar classifier learns the user's labels. No cloud service is involved.
+Universal Switch is a local acoustic control system that learns user-defined
+labels for the surface or location of knocks, such as `desk` or `wall`. It also
+counts threshold-qualified knocks within each captured window. By default, a
+frozen Microsoft BEATs Iter3+ AS2M encoder creates 768-D audio embeddings and an
+incremental classifier learns the user's labels. Audio classification runs
+locally without a cloud service.
 
 Successful classifications can be published to smart-home platforms through an
 optional connector layer. Home Assistant is currently supported; without a
@@ -102,13 +103,13 @@ its examples; deleting the final class also removes the empty state file. Enter
 `list` to show every registered label's physical-capture and exemplar counts.
 Enter `quit` or press Ctrl-C for a graceful shutdown.
 BEATs still mean-pools encoder tokens inside the shortened first-impact window.
-Its embeddings use L2 normalization and cosine distance with a
-provisional global ceiling of `0.15`; prefer the offline evaluator's calibrated
-value when representative validation data is available. Each class becomes
-eligible after three independent physical captures and is represented by its
-prototype, registered exemplars, and leave-one-out spread. A prediction must pass both its
+Its embeddings use L2 normalization and cosine distance with a default global
+ceiling of `0.15`; prefer the offline evaluator's calibrated value when
+representative validation data is available. Each class becomes eligible after
+three independent physical captures and is represented by its class centroid,
+registered exemplars, and leave-one-out spread. A prediction must pass both its
 class-specific distance radius and the margin from the runner-up class. Known
-class probabilities are derived from the blended prototype/exemplar scores.
+class probabilities are derived from the blended centroid/exemplar scores.
 
 An accepted capture triggers its action immediately. After an event, matching
 captures are suppressed for two seconds. Rejected captures clear pending
@@ -140,7 +141,8 @@ cp config/connectors.example.json config/connectors.json
 ```
 
 `config/connectors.json` is ignored by Git. It uses a versioned, multi-connector
-format even though Home Assistant is the only connector currently implemented:
+format designed for additional platforms; the included connector targets Home
+Assistant:
 
 ```json
 {
