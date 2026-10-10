@@ -31,6 +31,57 @@ def test_beats_is_cli_default(monkeypatch) -> None:
     assert resolve_gain_db(arguments) == ()
 
 
+def test_cli_threshold_mode_reaches_saved_classifier(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(sys, "argv", ["main.py", "--model", "pann", "--threshold-mode", "auto"])
+    arguments = parse_args()
+    metadata = {"feature_extractor": "pann", "checkpoint_sha256": "pann-sha"}
+    path = tmp_path / "auto.npz"
+    classifier = load_or_create_classifier(
+        path,
+        "pann",
+        metadata,
+        1,
+        0.2,
+        "cosine",
+        0.5,
+        2.0,
+        None,
+        None,
+        threshold_mode=arguments.threshold_mode,
+    )
+    for offset in (0.0, 0.01, 0.02):
+        classifier.register_tap(np.array([1.0, offset]), "desk")
+    classifier.save(path, metadata)
+    restored = load_or_create_classifier(
+        path,
+        "pann",
+        metadata,
+        1,
+        0.2,
+        "cosine",
+        0.5,
+        2.0,
+        None,
+        None,
+        threshold_mode=arguments.threshold_mode,
+    )
+    assert restored.threshold_mode == "auto"
+    with pytest.raises(ValueError, match="threshold mode"):
+        load_or_create_classifier(
+            path,
+            "pann",
+            metadata,
+            1,
+            0.2,
+            "cosine",
+            0.5,
+            2.0,
+            None,
+            None,
+            threshold_mode="fixed",
+        )
+
+
 def test_missing_default_connector_config_disables_connectors(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["main.py"])

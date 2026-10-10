@@ -227,6 +227,58 @@ def test_rejection_uses_only_predicted_labels_threshold() -> None:
     assert classifier.predict(query) == "desk"
 
 
+def test_auto_threshold_requires_independent_original_captures() -> None:
+    classifier = TapClassifier(distance_mode="cosine", threshold_mode="auto")
+    for capture_id in range(4):
+        classifier.register_tap(unit_vector(0.01 * capture_id), "desk", capture_id=capture_id)
+        for _ in range(3):
+            classifier.register_tap(
+                unit_vector(0.01 * capture_id), "desk", capture_id=capture_id, augmented=True
+            )
+    assert classifier.threshold_calibrations["desk"].sample_count == 4
+    assert classifier.threshold_calibrations["desk"].source == "fallback"
+    classifier.register_tap(unit_vector(0.04), "desk", capture_id=4)
+    assert classifier.threshold_calibrations["desk"].source == "registration"
+
+
+def test_validation_threshold_round_trip_and_delete(tmp_path) -> None:
+    classifier = TapClassifier(
+        distance_mode="cosine", distance_threshold=0.2, threshold_mode="auto"
+    )
+    for angle in (0.0, 0.01, 0.02, 0.03, 0.04):
+        classifier.register_tap(unit_vector(angle), "desk")
+    classifier.set_validation_calibration("desk", 0.015, np.array([0.005]))
+    path = tmp_path / "auto.npz"
+    classifier.save(path)
+    restored = TapClassifier.load(path)
+    assert restored.threshold_mode == "auto"
+    assert restored.threshold_for_label("desk") == 0.015
+    assert restored.threshold_calibrations == classifier.threshold_calibrations
+    assert restored.predict(unit_vector(0.02)) == classifier.predict(unit_vector(0.02))
+    restored.delete_class("desk")
+    assert restored.threshold_calibrations == {}
+    assert restored.distance_thresholds == {}
+
+
+def test_prototype_state_without_threshold_calibrations_still_loads(tmp_path) -> None:
+    classifier = TapClassifier(distance_mode="cosine", distance_threshold=0.2)
+    for angle in (0.0, 0.01, 0.02):
+        classifier.register_tap(unit_vector(angle), "desk")
+    path = tmp_path / "prototype.npz"
+    classifier.save(path)
+    with np.load(path, allow_pickle=False) as state:
+        payload = {key: state[key].copy() for key in state.files}
+    manifest = json.loads(str(payload["manifest"].item()))
+    for key in ("threshold_mode", "distance_thresholds", "threshold_calibrations"):
+        manifest.pop(key)
+    payload["manifest"] = np.asarray(json.dumps(manifest))
+    np.savez_compressed(path, **payload)
+    restored = TapClassifier.load(path)
+    assert restored.threshold_mode == "fixed"
+    assert restored.threshold_for_label("desk") == 0.2
+    assert restored.predict(unit_vector(0.01)) == "desk"
+
+
 def write_schema_v1_state(path, feature_extractor: str) -> None:
     manifest = {
         "schema_version": 1,
