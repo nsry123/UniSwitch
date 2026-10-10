@@ -9,12 +9,44 @@ import numpy as np
 
 PANN_CHECKPOINT_PATH: Final = Path("models/Cnn14_mAP=0.431.pth")
 PANN_CHECKPOINT_SHA256: Final = "0dc499e40e9761ef5ea061ffc77697697f277f6a960894903df3ada000e34b31"
+BEATS_CHECKPOINT_PATH: Final = Path("models/BEATs_iter3_plus_AS2M.pt")
+BEATS_SOURCE_REVISION: Final = "833df7e7832e5064a281131ee64a481afa8e5b95"
+BEATS_EMBEDDING_DIM: Final = 768
+BEATS_POOLING: Final = "mean"
+BEATS_FEATURE_ALIGNMENT: Final = "first_threshold_onset"
+BEATS_FEATURE_WINDOW_SECONDS: Final = 0.580
+BEATS_PRE_ONSET_SECONDS: Final = 0.200
+BEATS_NORMALIZATION_VERSION: Final = "rms01-fbank-global-v1"
+BEATS_TARGET_RMS: Final = 0.1
+BEATS_PEAK_CEILING: Final = 1.0
+BEATS_SILENCE_EPSILON: Final = 1e-8
+BEATS_FBANK_NORMALIZATION: Final = "per_window_global_mean_std"
+BEATS_FBANK_EPSILON: Final = 1e-5
+BEATS_FBANK_STD_SCALE: Final = 2.0
 DEFAULT_ENERGY_THRESHOLD: Final = 0.015
 KNOCK_RMS_FRAME_SECONDS: Final = 0.020
 KNOCK_RMS_HOP_SECONDS: Final = 0.010
 KNOCK_RELEASE_RATIO: Final = 0.7
 KNOCK_RELEASE_SECONDS: Final = 0.060
 MIN_KNOCK_INTERVAL_SECONDS: Final = 0.120
+
+
+def beats_input_normalization_metadata() -> dict[str, object]:
+    """Return the persisted, versioned BEATs input-normalization contract."""
+    return {
+        "version": BEATS_NORMALIZATION_VERSION,
+        "waveform": {
+            "mode": "rms",
+            "target_rms": BEATS_TARGET_RMS,
+            "peak_ceiling": BEATS_PEAK_CEILING,
+            "silence_epsilon": BEATS_SILENCE_EPSILON,
+        },
+        "fbank": {
+            "mode": BEATS_FBANK_NORMALIZATION,
+            "std_scale": BEATS_FBANK_STD_SCALE,
+            "epsilon": BEATS_FBANK_EPSILON,
+        },
+    }
 
 
 class SignalProcessor:
@@ -25,40 +57,52 @@ class SignalProcessor:
 
     def __init__(
         self,
-        model: str = "legacy",
+        model: str = "beats",
         sample_rate: int = 16000,
         hop_length: int = 512,
-        checkpoint_path: str | Path = PANN_CHECKPOINT_PATH,
+        checkpoint_path: str | Path | None = None,
         verify_checkpoint: bool = True,
     ) -> None:
         normalized_model = model.lower()
         if normalized_model == "default":
-            normalized_model = "legacy"
-        if normalized_model not in {"legacy", "pann"}:
-            raise ValueError("model must be either 'legacy' or 'pann'")
+            normalized_model = "beats"
+        if normalized_model not in {"beats", "legacy", "pann"}:
+            raise ValueError("model must be one of: beats, legacy, pann")
         if sample_rate <= 0 or hop_length <= 0:
             raise ValueError("sample_rate and hop_length must be positive")
 
         self.sample_rate = sample_rate
         self.hop_length = hop_length
         self.model = normalized_model
-        self.checkpoint_path = Path(checkpoint_path)
+        default_checkpoint = {
+            "beats": BEATS_CHECKPOINT_PATH,
+            "pann": PANN_CHECKPOINT_PATH,
+        }.get(normalized_model)
+        self.checkpoint_path = (
+            Path(checkpoint_path) if checkpoint_path is not None else default_checkpoint
+        )
         self.verify_checkpoint = verify_checkpoint
         self.checkpoint_sha256: str | None = None
-        if self.model == "pann":
+        if self.model == "beats":
+            self.sample_rate = 16000
+        elif self.model == "pann":
             self.sample_rate = 32000
 
-        # PANN model and its transforms are loaded lazily on first call to
-        # extract_features_pann(). This avoids a multi-second PyTorch startup
-        # cost when the class is instantiated in contexts that don't use PANN.
+        # Neural encoders are loaded lazily. prepare() loads the selected encoder
+        # before capture so checkpoint errors are reported at startup.
         self._pann_model: Any | None = None
         self._pann_device: Any | None = None
+        self._beats_model: Any | None = None
+        self._beats_device: Any | None = None
 
     def prepare(self) -> str | None:
         """Load resources required for feature extraction before capture starts."""
-        if self.model != "pann":
+        if self.model == "legacy":
             return None
-        if self._pann_model is None:
+        assert self.checkpoint_path is not None
+        if self.model == "beats" and self._beats_model is None:
+            self._load_beats(str(self.checkpoint_path))
+        elif self.model == "pann" and self._pann_model is None:
             self._load_pann(str(self.checkpoint_path))
         return self.checkpoint_sha256
 
@@ -93,6 +137,79 @@ class SignalProcessor:
         if not np.isfinite(waveform).all():
             raise ValueError("audio_frame contains NaN or infinite samples")
         return float(np.sqrt(np.mean(waveform.astype(np.float64) ** 2)))
+
+    def prepare_feature_audio(
+        self,
+        audio_clip: np.ndarray,
+        trigger_sample: int,
+        energy_threshold: float = DEFAULT_ENERGY_THRESHOLD,
+    ) -> np.ndarray:
+        """Return audio shaped for the selected feature extractor.
+
+        BEATs receives a fixed first-impact window so its temporal mean pool is
+        not dominated by the remainder of the capture. ``trigger_sample`` is
+        the coarse start of the stream chunk that opened the live energy gate;
+        the onset is refined from there with the same RMS framing used for tap
+        counting. Other extractors retain their historical full-clip input.
+        """
+        waveform = self._validate_audio(audio_clip)
+        bounds = self.feature_window_bounds(waveform, trigger_sample, energy_threshold)
+        if bounds is None:
+            return waveform
+        source_start, _, source_end = bounds
+
+        window_samples = round(BEATS_FEATURE_WINDOW_SECONDS * self.sample_rate)
+        copy_start = max(0, source_start)
+        copy_end = min(waveform.size, source_end)
+        destination_start = copy_start - source_start
+
+        prepared = np.zeros(window_samples, dtype=np.float32)
+        prepared[destination_start : destination_start + copy_end - copy_start] = waveform[
+            copy_start:copy_end
+        ]
+        return prepared
+
+    def feature_window_bounds(
+        self,
+        audio_clip: np.ndarray,
+        trigger_sample: int,
+        energy_threshold: float = DEFAULT_ENERGY_THRESHOLD,
+    ) -> tuple[int, int, int] | None:
+        """Return nominal ``(start, onset, end)`` samples for feature input.
+
+        Bounds may extend beyond the waveform where zero-padding is part of the
+        BEATs input. Other extractors return ``None`` because they consume the
+        complete capture.
+        """
+        waveform = self._validate_audio(audio_clip)
+        if self.model != "beats":
+            return None
+        if not isinstance(trigger_sample, (int, np.integer)):
+            raise TypeError("trigger_sample must be an integer sample index")
+        if trigger_sample < 0 or trigger_sample >= waveform.size:
+            raise ValueError(
+                f"trigger_sample must be within the waveform, got {trigger_sample}"
+            )
+        if not np.isfinite(energy_threshold) or energy_threshold < 0:
+            raise ValueError("energy_threshold must be finite and non-negative")
+
+        frame_length = max(1, round(KNOCK_RMS_FRAME_SECONDS * self.sample_rate))
+        hop_length = max(1, round(KNOCK_RMS_HOP_SECONDS * self.sample_rate))
+        search_waveform = waveform[int(trigger_sample) :]
+        energy = self._rms_envelope(search_waveform, frame_length, hop_length)
+        crossings = np.flatnonzero(energy > energy_threshold)
+        if crossings.size == 0:
+            raise ValueError(
+                "no threshold-qualified onset found at or after trigger_sample; "
+                "check the capture or energy threshold"
+            )
+
+        onset_sample = int(trigger_sample) + int(crossings[0]) * hop_length
+        window_samples = round(BEATS_FEATURE_WINDOW_SECONDS * self.sample_rate)
+        pre_onset_samples = round(BEATS_PRE_ONSET_SECONDS * self.sample_rate)
+        source_start = onset_sample - pre_onset_samples
+        source_end = source_start + window_samples
+        return source_start, onset_sample, source_end
 
     # ------------------------------------------------------------------ #
     #  Knock counting                                                      #
@@ -172,9 +289,21 @@ class SignalProcessor:
 
     def extract_features(self, audio_clip: np.ndarray) -> np.ndarray:
         waveform = self._validate_audio(audio_clip)
+        if self.model == "beats":
+            return self.extract_features_beats(audio_clip=waveform)
         if self.model == "pann":
             return self.extract_features_pann(audio_clip=waveform)
         return self.extract_features_default(audio_clip=waveform)
+
+    def normalize_beats_waveform(self, audio_clip: np.ndarray) -> np.ndarray:
+        """Return a peak-safe, fixed-RMS waveform for BEATs feature extraction."""
+        waveform = self._validate_audio(audio_clip)
+        rms = float(np.sqrt(np.mean(waveform.astype(np.float64) ** 2)))
+        if rms <= BEATS_SILENCE_EPSILON:
+            raise ValueError("BEATs waveform is effectively silent")
+        peak = float(np.max(np.abs(waveform)))
+        scale = min(BEATS_TARGET_RMS / rms, BEATS_PEAK_CEILING / peak)
+        return np.multiply(waveform, scale, dtype=np.float32)
 
     def extract_features_default(self, audio_clip: np.ndarray) -> np.ndarray:
         """
@@ -210,6 +339,7 @@ class SignalProcessor:
 
     def validate_pann_checkpoint(self) -> str:
         """Validate checkpoint presence and, by default, official SHA-256."""
+        assert self.checkpoint_path is not None
         resolved_checkpoint = self.checkpoint_path.expanduser().resolve()
         if not resolved_checkpoint.is_file():
             raise FileNotFoundError(
@@ -224,6 +354,116 @@ class SignalProcessor:
             )
         self.checkpoint_sha256 = actual_sha256
         return actual_sha256
+
+    def validate_beats_checkpoint(self) -> str:
+        """Validate a manually installed BEATs checkpoint against its sidecar digest."""
+        assert self.checkpoint_path is not None
+        resolved_checkpoint = self.checkpoint_path.expanduser().resolve()
+        if not resolved_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"BEATs checkpoint not found: {resolved_checkpoint}. "
+                "Run 'python scripts/install_beats.py /path/to/official/checkpoint "
+                "--sha256 <trusted-digest>'."
+            )
+        actual_sha256 = self._sha256_file(resolved_checkpoint)
+        sidecar = resolved_checkpoint.with_suffix(".sha256")
+        if self.verify_checkpoint:
+            if not sidecar.is_file():
+                raise FileNotFoundError(
+                    f"BEATs checksum sidecar not found: {sidecar}. "
+                    "Install the checkpoint with scripts/install_beats.py."
+                )
+            sidecar_tokens = sidecar.read_text(encoding="utf-8").split()
+            if not sidecar_tokens:
+                raise ValueError(f"invalid BEATs checksum sidecar: {sidecar}")
+            expected_sha256 = sidecar_tokens[0].lower()
+            if len(expected_sha256) != 64 or any(
+                character not in "0123456789abcdef" for character in expected_sha256
+            ):
+                raise ValueError(f"invalid BEATs checksum sidecar: {sidecar}")
+            if actual_sha256 != expected_sha256:
+                raise ValueError(
+                    "BEATs checkpoint checksum mismatch: "
+                    f"expected {expected_sha256}, received {actual_sha256}"
+                )
+        self.checkpoint_sha256 = actual_sha256
+        return actual_sha256
+
+    def _load_beats(self, checkpoint_path: str) -> None:
+        """Strictly load the pinned BEATs pretraining checkpoint."""
+        import torch
+
+        from src.audio.beats import BEATs, BEATsConfig
+
+        resolved_checkpoint = Path(checkpoint_path).expanduser().resolve()
+        original_checkpoint = self.checkpoint_path
+        self.checkpoint_path = resolved_checkpoint
+        try:
+            self.validate_beats_checkpoint()
+        finally:
+            self.checkpoint_path = original_checkpoint
+
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+
+        checkpoint = torch.load(resolved_checkpoint, map_location="cpu", weights_only=True)
+        if not isinstance(checkpoint, dict) or not {"cfg", "model"}.issubset(checkpoint):
+            raise ValueError("BEATs checkpoint must contain 'cfg' and 'model' mappings")
+        if not isinstance(checkpoint["cfg"], dict) or not isinstance(checkpoint["model"], dict):
+            raise ValueError("BEATs checkpoint cfg and model entries must be mappings")
+        config = BEATsConfig(checkpoint["cfg"])
+        if config.finetuned_model:
+            raise ValueError("expected a BEATs pretraining checkpoint, not a fine-tuned model")
+        if config.encoder_embed_dim != BEATS_EMBEDDING_DIM:
+            raise ValueError(
+                f"expected a {BEATS_EMBEDDING_DIM}-D BEATs encoder, "
+                f"received {config.encoder_embed_dim}"
+            )
+        model = BEATs(config)
+        model.load_state_dict(checkpoint["model"], strict=True)
+        model.requires_grad_(False)
+        model.eval()
+        model.to(device)
+        self._beats_model = model
+        self._beats_device = device
+        print(f"[*] BEATs encoder loaded on {device} from {resolved_checkpoint}")
+
+    def extract_features_beats(self, audio_clip: np.ndarray) -> np.ndarray:
+        """Return a mean-pooled 768-D representation from the frozen BEATs encoder."""
+        import torch
+
+        waveform_array = self.normalize_beats_waveform(audio_clip)
+        if self._beats_model is None:
+            assert self.checkpoint_path is not None
+            self._load_beats(str(self.checkpoint_path))
+        assert self._beats_model is not None and self._beats_device is not None
+        waveform = torch.from_numpy(waveform_array.astype(np.float32)).unsqueeze(0)
+        with torch.inference_mode():
+            # The official Kaldi-compatible frontend runs on CPU. Only the compact
+            # filterbank representation is moved to the selected accelerator.
+            fbank = self._beats_model.preprocess_per_window(
+                waveform, BEATS_FBANK_EPSILON
+            ).unsqueeze(1)
+            features = self._beats_model.patch_embedding(fbank.to(self._beats_device))
+            features = features.reshape(features.shape[0], features.shape[1], -1)
+            features = features.transpose(1, 2)
+            features = self._beats_model.layer_norm(features)
+            if self._beats_model.post_extract_proj is not None:
+                features = self._beats_model.post_extract_proj(features)
+            features = self._beats_model.dropout_input(features)
+            encoded, _ = self._beats_model.encoder(features)
+            embedding = encoded.mean(dim=1)
+        result = embedding.squeeze(0).cpu().numpy().astype(np.float32, copy=False)
+        if result.shape != (BEATS_EMBEDDING_DIM,) or not np.isfinite(result).all():
+            raise ValueError(
+                f"BEATs returned an invalid embedding: shape={result.shape}, "
+                f"finite={bool(np.isfinite(result).all())}"
+            )
+        return result
 
     # ------------------------------------------------------------------ #
     #  PANN CNN14 feature extractor                                       #
@@ -458,6 +698,7 @@ class SignalProcessor:
             selected_checkpoint = (
                 self.checkpoint_path if checkpoint_path is None else checkpoint_path
             )
+            assert selected_checkpoint is not None
             self._load_pann(str(selected_checkpoint))
 
         # ── Resample 16 kHz → 32 kHz ────────────────────────────────────

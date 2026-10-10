@@ -5,4 +5,5 @@ PyAudio==0.2.14
 scikit-learn==1.8.0
 scipy==1.17.1
 torch==2.11.0
+torchaudio==2.11.0
 torchlibrosa==0.1.0

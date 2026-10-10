@@ -7,12 +7,88 @@ const peakValue = document.querySelector("#peak-value");
 const captureState = document.querySelector("#capture-state");
 const sampleRate = document.querySelector("#sample-rate");
 const connectionStatus = document.querySelector("#connection-status");
+const resultPanel = document.querySelector("#result-panel");
+const resultStatus = document.querySelector("#result-status");
+const resultLabel = document.querySelector("#result-label");
+const resultReason = document.querySelector("#result-reason");
+const resultCandidate = document.querySelector("#result-candidate");
+const resultConfidence = document.querySelector("#result-confidence");
+const resultDistance = document.querySelector("#result-distance");
+const resultMargin = document.querySelector("#result-margin");
+const calibrationPanel = document.querySelector("#calibration-panel");
+const calibrationState = document.querySelector("#calibration-state");
+const calibrationTitle = document.querySelector("#calibration-title");
+const calibrationMessage = document.querySelector("#calibration-message");
+const calibrationProgress = document.querySelector("#calibration-progress");
+const calibrationClasses = document.querySelector("#calibration-classes");
+const calibrationUnknowns = document.querySelector("#calibration-unknowns");
+const calibrationKnown = document.querySelector("#calibration-known");
+const calibrationRejection = document.querySelector("#calibration-rejection");
+const calibrationParameters = document.querySelector("#calibration-parameters");
 
 const history = [];
 const maxPoints = 240;
 let latestWaveform = [];
 let threshold = 0.015;
 let lastSequence = -1;
+let lastResultSequence = -1;
+let latestFeatureWindow = null;
+
+function renderResult(result) {
+  if (!result) return;
+  let state = "registration";
+  let badge = "Registered";
+  if (result.accepted === true) {
+    state = "accepted";
+    badge = result.status === "EVENT" ? "Accepted" : "Accepted · suppressed";
+  } else if (result.accepted === false) {
+    state = "unknown";
+    badge = "Unknown";
+  }
+  resultPanel.className = `panel result-panel ${state}`;
+  resultStatus.className = `result-badge ${state}`;
+  resultStatus.textContent = badge;
+  resultLabel.textContent = result.label;
+  resultReason.textContent = result.reason;
+  resultCandidate.textContent = result.candidate || "—";
+  resultConfidence.textContent =
+    result.confidence == null ? "—" : `${(result.confidence * 100).toFixed(1)}%`;
+  resultDistance.textContent =
+    result.score == null || result.acceptanceRadius == null
+      ? "—"
+      : `${result.score.toFixed(3)} / ${result.acceptanceRadius.toFixed(3)}`;
+  resultMargin.textContent =
+    result.margin == null
+      ? result.accepted == null ? "—" : "Single class"
+      : `${result.margin.toFixed(3)} / ${result.requiredMargin.toFixed(3)} required`;
+}
+
+function renderCalibration(calibration) {
+  if (!calibration) return;
+  const state = calibration.state || "needs_data";
+  calibrationPanel.className = `panel calibration-panel ${state}`;
+  calibrationState.className = `result-badge ${state === "failed" ? "unknown" : state === "passed" || state === "ready" ? "accepted" : "registration"}`;
+  calibrationState.textContent = state.replace("_", " ");
+  calibrationTitle.textContent = state === "passed" ? "Classifier calibrated" : "Classifier setup";
+  calibrationMessage.textContent = calibration.message || "—";
+  const done = calibration.evaluatedCandidates || 0;
+  const total = calibration.totalCandidates || 0;
+  calibrationProgress.textContent = state === "running" && total
+    ? `Evaluated ${done.toLocaleString()} of ${total.toLocaleString()} candidates`
+    : "";
+  const counts = Object.entries(calibration.classCaptureCounts || {});
+  calibrationClasses.textContent = counts.length
+    ? counts.map(([label, count]) => `${label}: ${count}`).join(", ")
+    : "—";
+  calibrationUnknowns.textContent = `${calibration.unknownCaptureCount || 0} / 10`;
+  const metrics = calibration.metrics;
+  calibrationKnown.textContent = metrics ? `${(metrics.knownAccuracy * 100).toFixed(1)}%` : "—";
+  calibrationRejection.textContent = metrics ? `${(metrics.unknownRejection * 100).toFixed(1)}%` : "—";
+  const parameters = calibration.parameters;
+  calibrationParameters.textContent = parameters
+    ? `k=${parameters.n_neighbors}, distance=${parameters.distance_threshold.toFixed(4)}, prototype=${parameters.prototype_weight.toFixed(2)}, spread=${parameters.spread_multiplier.toFixed(2)}, margin=${parameters.margin_threshold.toFixed(4)}, temperature=${parameters.probability_temperature.toFixed(4)}`
+    : "—";
+}
 
 function fitCanvas(canvas) {
   const ratio = window.devicePixelRatio || 1;
@@ -32,7 +108,11 @@ function drawEnergy() {
   const pad = { top: 18 * ratio, right: 18 * ratio, bottom: 27 * ratio, left: 54 * ratio };
   const chartWidth = width - pad.left - pad.right;
   const chartHeight = height - pad.top - pad.bottom;
-  const observedMax = Math.max(threshold * 2, 0.001, ...history);
+  const observedMax = Math.max(
+    threshold * 2,
+    0.001,
+    ...history.map((point) => point.energy),
+  );
   const yMax = observedMax * 1.18;
   const y = (value) => pad.top + chartHeight - (value / yMax) * chartHeight;
 
@@ -65,14 +145,53 @@ function drawEnergy() {
   ctx.fillText(`THRESHOLD ${threshold.toFixed(4)}`, pad.left + 8 * ratio, thresholdY - 8 * ratio);
 
   if (history.length > 1) {
+    const firstSequence = history[0].sequence;
+    const lastSequenceInHistory = history[history.length - 1].sequence;
     const gradient = ctx.createLinearGradient(0, pad.top, 0, height - pad.bottom);
     gradient.addColorStop(0, "rgba(88, 224, 176, 0.26)");
     gradient.addColorStop(1, "rgba(88, 224, 176, 0.01)");
     const x = (index) => pad.left + (index / (maxPoints - 1)) * chartWidth;
+
+    if (
+      latestFeatureWindow &&
+      latestFeatureWindow.endSequence >= firstSequence &&
+      latestFeatureWindow.startSequence <= lastSequenceInHistory
+    ) {
+      const sequenceX = (sequence) => {
+        const fraction = (sequence - firstSequence) /
+          Math.max(1, lastSequenceInHistory - firstSequence);
+        const historyIndex = fraction * (history.length - 1);
+        return x(historyIndex);
+      };
+      const windowStart = Math.max(pad.left, sequenceX(latestFeatureWindow.startSequence));
+      const windowEnd = Math.min(
+        width - pad.right,
+        sequenceX(latestFeatureWindow.endSequence),
+      );
+      const onsetX = Math.min(
+        width - pad.right,
+        Math.max(pad.left, sequenceX(latestFeatureWindow.onsetSequence)),
+      );
+      ctx.fillStyle = "rgba(80, 150, 255, 0.16)";
+      ctx.fillRect(windowStart, pad.top, Math.max(1, windowEnd - windowStart), chartHeight);
+      ctx.strokeStyle = "rgba(108, 174, 255, 0.9)";
+      ctx.lineWidth = 1.5 * ratio;
+      ctx.setLineDash([4 * ratio, 3 * ratio]);
+      ctx.beginPath();
+      ctx.moveTo(onsetX, pad.top);
+      ctx.lineTo(onsetX, height - pad.bottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#8fc2ff";
+      ctx.font = `${11 * ratio}px ui-monospace, SFMono-Regular, monospace`;
+      ctx.textAlign = "left";
+      ctx.fillText("BEATs FEATURE 580 ms", windowStart + 6 * ratio, pad.top + 14 * ratio);
+    }
+
     ctx.beginPath();
-    history.forEach((value, index) => {
-      if (index === 0) ctx.moveTo(x(index), y(value));
-      else ctx.lineTo(x(index), y(value));
+    history.forEach((point, index) => {
+      if (index === 0) ctx.moveTo(x(index), y(point.energy));
+      else ctx.lineTo(x(index), y(point.energy));
     });
     ctx.lineTo(x(history.length - 1), height - pad.bottom);
     ctx.lineTo(pad.left, height - pad.bottom);
@@ -81,9 +200,9 @@ function drawEnergy() {
     ctx.fill();
 
     ctx.beginPath();
-    history.forEach((value, index) => {
-      if (index === 0) ctx.moveTo(x(index), y(value));
-      else ctx.lineTo(x(index), y(value));
+    history.forEach((point, index) => {
+      if (index === 0) ctx.moveTo(x(index), y(point.energy));
+      else ctx.lineTo(x(index), y(point.energy));
     });
     ctx.strokeStyle = "#58e0b0";
     ctx.lineWidth = 2 * ratio;
@@ -122,11 +241,17 @@ async function poll() {
     const state = await response.json();
     threshold = state.threshold;
     if (state.sequence !== lastSequence) {
-      history.push(state.energy);
+      history.push({ sequence: state.sequence, energy: state.energy });
       if (history.length > maxPoints) history.shift();
       latestWaveform = state.waveform;
       lastSequence = state.sequence;
     }
+    latestFeatureWindow = state.featureWindow;
+    if (state.resultSequence !== lastResultSequence) {
+      renderResult(state.lastResult);
+      lastResultSequence = state.resultSequence;
+    }
+    renderCalibration(state.calibration);
     energyValue.textContent = state.energy.toFixed(4);
     thresholdValue.textContent = state.threshold.toFixed(4);
     thresholdLegend.textContent = state.threshold.toFixed(4);

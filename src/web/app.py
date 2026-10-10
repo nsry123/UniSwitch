@@ -6,12 +6,15 @@ import json
 import threading
 import time
 import webbrowser
+from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from src.controller import CapturePurpose, EventDecision
 
 WEB_ROOT = Path(__file__).parent
 TEMPLATE_PATH = WEB_ROOT / "templates" / "monitor.html"
@@ -85,6 +88,19 @@ class MicrophoneMonitor:
         self._capturing = False
         self._waveform: list[float] = []
         self._updated_at = 0.0
+        self._feature_window: dict[str, float] | None = None
+        self._result_sequence = 0
+        self._last_result: dict[str, Any] | None = None
+        self._calibration: dict[str, Any] = {
+            "state": "needs_data",
+            "message": "Register class captures to begin calibration.",
+            "classCaptureCounts": {},
+            "unknownCaptureCount": 0,
+            "evaluatedCandidates": 0,
+            "totalCandidates": 0,
+            "metrics": None,
+            "parameters": None,
+        }
         self._server: _MonitorHTTPServer | None = None
         self._server_thread: threading.Thread | None = None
 
@@ -118,7 +134,119 @@ class MicrophoneMonitor:
                 "waveform": self._waveform,
                 "sampleRate": self.sample_rate,
                 "active": self._updated_at > 0 and time.monotonic() - self._updated_at < 1.0,
+                "featureWindow": self._feature_window,
+                "resultSequence": self._result_sequence,
+                "lastResult": self._last_result,
+                "calibration": self._calibration,
             }
+
+    def publish_feature_window(
+        self,
+        start_sequence: float,
+        onset_sequence: float,
+        end_sequence: float,
+    ) -> None:
+        """Mark the exact BEATs feature interval on the energy timeline."""
+        values = np.asarray(
+            [start_sequence, onset_sequence, end_sequence], dtype=np.float64
+        )
+        if not np.isfinite(values).all():
+            raise ValueError("feature window sequences must be finite")
+        if not start_sequence <= onset_sequence <= end_sequence:
+            raise ValueError("feature window sequences must be ordered")
+        with self._lock:
+            self._feature_window = {
+                "startSequence": float(start_sequence),
+                "onsetSequence": float(onset_sequence),
+                "endSequence": float(end_sequence),
+            }
+
+    def publish_calibration(self, calibration: Mapping[str, Any]) -> None:
+        """Publish a complete calibration-status snapshot."""
+        with self._lock:
+            self._calibration = dict(calibration)
+
+    @staticmethod
+    def _finite(value: float | None) -> float | None:
+        return float(value) if value is not None and np.isfinite(value) else None
+
+    def publish_decision(self, decision: EventDecision) -> None:
+        """Publish the most recent classified or registration capture."""
+        classification = decision.classification
+        if classification is None:
+            if decision.purpose is CapturePurpose.UNKNOWN_CALIBRATION:
+                label = "Unknown calibration"
+                reason = decision.message or "Stored as an unknown calibration capture."
+            else:
+                label = decision.label or "Registration capture"
+                reason = decision.message or (
+                    "Stored as a registration example; classification was not run."
+                )
+            result: dict[str, Any] = {
+                "status": decision.status.value,
+                "label": label,
+                "accepted": None,
+                "reason": reason,
+                "purpose": decision.purpose.value,
+                "rejectionReason": None,
+                "tapCount": decision.tap_count,
+                "score": None,
+                "acceptanceRadius": None,
+                "margin": None,
+                "requiredMargin": None,
+                "confidence": None,
+                "candidate": None,
+                "probabilities": {},
+            }
+        else:
+            probabilities = dict(classification.probabilities)
+            candidate = (
+                max(probabilities, key=lambda label: probabilities[label])
+                if probabilities
+                else None
+            )
+            score = self._finite(classification.score)
+            radius = self._finite(classification.acceptance_radius)
+            margin = self._finite(classification.margin)
+            required_margin = self._finite(classification.required_margin)
+            confidence = max(probabilities.values()) if probabilities else None
+            if classification.accepted:
+                reason = (
+                    f"Score {score:.3f} is within the class radius {radius:.3f}."
+                    if margin is None
+                    else f"Score {score:.3f} is within radius {radius:.3f}; "
+                    f"margin {margin:.3f} clears the required {required_margin:.3f}."
+                )
+                if decision.status.value == "NONE":
+                    reason += " No action was emitted because confirmation or cooldown is active."
+            elif classification.rejection_reason == "distance":
+                reason = f"Closest score {score:.3f} exceeds the class radius {radius:.3f}."
+            elif classification.rejection_reason == "margin":
+                reason = (
+                    f"The closest classes are ambiguous: margin {margin:.3f} is below "
+                    f"the required {required_margin:.3f}."
+                )
+            else:
+                reason = "No class has the three examples required for classification."
+            result = {
+                "status": decision.status.value,
+                "label": classification.label,
+                "accepted": classification.accepted,
+                "reason": reason,
+                "rejectionReason": classification.rejection_reason,
+                "tapCount": decision.tap_count,
+                "score": score,
+                "acceptanceRadius": radius,
+                "margin": margin,
+                "requiredMargin": required_margin,
+                "confidence": confidence,
+                "candidate": candidate,
+                "probabilities": probabilities,
+                "purpose": decision.purpose.value,
+            }
+        with self._lock:
+            self._result_sequence += 1
+            self._last_result = result
 
     def start(self, open_browser: bool = True) -> None:
         """Start the local server and optionally open its page in a browser."""
