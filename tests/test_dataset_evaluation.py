@@ -3,9 +3,12 @@ import csv
 import numpy as np
 import pytest
 
-from src.ml.classifier import TapClassifier
 from src.ml.dataset import REQUIRED_COLUMNS, load_manifest
-from src.ml.evaluation import calibrate_classifier, evaluate_classifier
+from src.ml.evaluation import (
+    calibrate_classifier,
+    calibrate_grouped_classifier,
+    evaluate_classifier,
+)
 
 
 def write_manifest(path, rows) -> None:
@@ -85,9 +88,16 @@ def test_calibration_and_evaluation_separate_unknown_rejection() -> None:
 
 def test_cosine_calibration_matches_runtime_distance_mode() -> None:
     train_x = np.array(
-        [[1.0, 0.0], [1.0, 0.01], [0.0, 1.0], [0.01, 1.0]]
+        [
+            [1.0, 0.0],
+            [1.0, 0.01],
+            [1.0, -0.01],
+            [0.0, 1.0],
+            [0.01, 1.0],
+            [-0.01, 1.0],
+        ]
     )
-    train_y = np.array(["desk", "desk", "wall", "wall"])
+    train_y = np.array(["desk", "desk", "desk", "wall", "wall", "wall"])
     validation_x = np.array([[10.0, 0.0], [0.0, 10.0], [-1.0, 0.0]])
     validation_y = np.array(["desk", "wall", "unknown-surface"])
 
@@ -109,58 +119,47 @@ def test_cosine_calibration_matches_runtime_distance_mode() -> None:
     assert report.unknown_rejection_rate == 1.0
 
 
-def test_auto_calibration_uses_validation_impostors_per_label() -> None:
-    train_x = np.array([[1.0, 0.0]] * 5 + [[0.0, 1.0]] * 5)
-    train_y = np.array(["desk"] * 5 + ["wall"] * 5)
-    validation_x = np.array(
-        [
-            [1.0, 0.01],
-            [0.01, 1.0],
-            [0.8, 0.6],
-            [0.6, 0.8],
-        ]
-    )
-    validation_y = np.array(["desk", "wall", "unknown-a", "unknown-b"])
+def test_calibration_requires_three_examples_per_class() -> None:
+    with pytest.raises(ValueError, match="at least three"):
+        calibrate_classifier(
+            np.array([[0.0, 0.0], [0.1, 0.0]]),
+            np.array(["desk", "desk"]),
+            np.array([[0.05, 0.0]]),
+            np.array(["desk"]),
+        )
 
-    classifier, calibration = calibrate_classifier(
-        train_x,
-        train_y,
-        validation_x,
-        validation_y,
+
+def test_grouped_calibration_uses_physical_captures_and_unknowns() -> None:
+    features = []
+    labels = []
+    capture_ids = []
+    augmented = []
+    for label, center, first_id in (("desk", 0.0, 0), ("wall", 1.0, 4)):
+        for offset in range(4):
+            capture_id = first_id + offset
+            vector = np.array([1.0 - center, center + offset * 0.002])
+            for scale, is_augmented in ((1.0, False), (0.8, True)):
+                features.append(vector * scale)
+                labels.append(label)
+                capture_ids.append(capture_id)
+                augmented.append(is_augmented)
+    negatives = np.tile(np.array([[-1.0, 0.0]]), (10, 1))
+
+    classifier, result = calibrate_grouped_classifier(
+        np.asarray(features),
+        np.asarray(labels),
+        np.asarray(capture_ids),
+        np.asarray(augmented),
+        negatives,
+        distance_mode="cosine",
         neighbor_candidates=(1,),
-        distance_mode="cosine",
-        threshold_mode="auto",
-        distance_threshold_cap=0.2,
+        prototype_weight_candidates=(0.5,),
+        spread_multiplier_candidates=(2.0,),
+        margin_ratio_candidates=(0.1,),
+        temperature_ratio_candidates=(0.5,),
     )
-    report = evaluate_classifier(classifier, validation_x, validation_y)
 
-    assert classifier.threshold_calibrations["desk"].source == "validation"
-    assert classifier.threshold_calibrations["wall"].source == "validation"
-    assert classifier.separation_calibrations["desk"].source == "validation"
-    assert classifier.separation_calibrations["wall"].source == "validation"
-    assert calibration.distance_thresholds == classifier.distance_thresholds
-    assert calibration.separation_thresholds == classifier.separation_thresholds
-    assert report.known_end_to_end_accuracy == 1.0
-    assert report.unknown_rejection_rate == 1.0
-    assert report.known_confusion_matrix["desk"]["desk"] == 1
-    assert report.per_label_recall == {"desk": 1.0, "wall": 1.0}
-    assert report.separation_summary["desk"]["count"] > 0
-
-
-def test_evaluation_reports_ambiguity_rejections() -> None:
-    classifier = TapClassifier(
-        n_neighbors=1,
-        distance_threshold=1.0,
-        distance_mode="cosine",
-        separation_threshold=0.15,
-    )
-    classifier.register_tap(np.array([1.0, 0.0]), "left")
-    classifier.register_tap(np.array([np.cos(0.1), np.sin(0.1)]), "right")
-    features = np.array([[np.cos(0.05), np.sin(0.05)], [1.0, 0.0]])
-    labels = np.array(["left", "left"])
-
-    report = evaluate_classifier(classifier, features, labels)
-
-    assert report.ambiguity_rejection_rate == 0.5
-    assert report.known_confusion_matrix["left"]["Unknown"] == 1
-    assert report.known_accepted_accuracy == 1.0
+    assert classifier.class_capture_counts() == {"desk": 4, "wall": 4}
+    assert result.fold_count == 4
+    assert result.known_end_to_end_accuracy >= 0.75
+    assert result.unknown_rejection_rate == 1.0

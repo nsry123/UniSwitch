@@ -20,6 +20,22 @@ class StubProcessor:
         self.count_thresholds.append(energy_threshold)
         return int(np.count_nonzero(waveform))
 
+    def prepare_feature_audio(
+        self,
+        waveform: np.ndarray,
+        trigger_sample: int,
+        energy_threshold: float = 0.015,
+    ) -> np.ndarray:
+        return waveform
+
+    def feature_window_bounds(
+        self,
+        waveform: np.ndarray,
+        trigger_sample: int,
+        energy_threshold: float = 0.015,
+    ) -> tuple[int, int, int] | None:
+        return None
+
     def extract_features(self, waveform: np.ndarray) -> np.ndarray:
         return np.array([waveform.mean(), waveform.max()])
 
@@ -62,6 +78,168 @@ def test_worker_delivers_processed_capture_without_microphone() -> None:
     assert received[0][1] == 1
     np.testing.assert_allclose(received[0][0], [1 / 3, 1.0])
     assert listener.processor.count_thresholds == [0.123]
+
+
+def test_worker_augments_only_when_requested() -> None:
+    processor = StubProcessor()
+    listener = worker_only_listener(processor)
+    received: list[tuple[np.ndarray, int, tuple[np.ndarray, ...]]] = []
+    callback_event = threading.Event()
+
+    def augmented_callback(
+        features: np.ndarray,
+        tap_count: int,
+        augmented_features: tuple[np.ndarray, ...],
+    ) -> None:
+        received.append((features, tap_count, augmented_features))
+        callback_event.set()
+
+    worker = threading.Thread(
+        target=listener._worker_loop,
+        args=(
+            lambda _features, _count: None,
+            None,
+            augmented_callback,
+            lambda: True,
+            (-6.0, 6.0),
+        ),
+    )
+    worker.start()
+    waveform = np.array([0.5, 0.0, 0.0, 0.0, 0.25, 0.0], dtype=np.float32)
+    listener._capture_queue.put(CapturedAudio(waveform, trigger_sample=3))
+    assert callback_event.wait(timeout=2.0)
+    listener.stop()
+    worker.join(timeout=2.0)
+
+    original, tap_count, variants = received[0]
+    np.testing.assert_allclose(original, [0.125, 0.5])
+    assert tap_count == 1
+    assert len(variants) == 2
+    np.testing.assert_allclose(
+        variants[0],
+        np.array([0.125, 0.5], dtype=np.float32) * (10.0 ** (-6.0 / 20.0)),
+    )
+    np.testing.assert_allclose(
+        variants[1],
+        np.array([0.125, 0.5], dtype=np.float32) * (10.0 ** (6.0 / 20.0)),
+    )
+    assert processor.count_thresholds == [0.123]
+
+
+def test_worker_counts_full_capture_but_reuses_one_feature_crop() -> None:
+    class CroppingProcessor(StubProcessor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.counted: list[np.ndarray] = []
+            self.prepared: list[tuple[np.ndarray, int, float]] = []
+
+        def count_taps(
+            self, waveform: np.ndarray, energy_threshold: float = 0.015
+        ) -> int:
+            self.counted.append(waveform.copy())
+            return 2
+
+        def prepare_feature_audio(
+            self,
+            waveform: np.ndarray,
+            trigger_sample: int,
+            energy_threshold: float = 0.015,
+        ) -> np.ndarray:
+            self.prepared.append((waveform.copy(), trigger_sample, energy_threshold))
+            return waveform[trigger_sample : trigger_sample + 2]
+
+    processor = CroppingProcessor()
+    listener = worker_only_listener(processor)
+    received: list[tuple[np.ndarray, tuple[np.ndarray, ...]]] = []
+    callback_event = threading.Event()
+
+    def callback(
+        features: np.ndarray,
+        _tap_count: int,
+        augmented_features: tuple[np.ndarray, ...],
+    ) -> None:
+        received.append((features, augmented_features))
+        callback_event.set()
+
+    waveform = np.array([0.01, 0.02, 0.5, 0.25, 0.75, 0.1], dtype=np.float32)
+    worker = threading.Thread(
+        target=listener._worker_loop,
+        args=(lambda *_args: None, None, callback, lambda: True, (-6.0,)),
+    )
+    worker.start()
+    listener._capture_queue.put(CapturedAudio(waveform, trigger_sample=2))
+    assert callback_event.wait(timeout=2.0)
+    listener.stop()
+    worker.join(timeout=2.0)
+
+    np.testing.assert_array_equal(processor.counted[0], waveform[2:])
+    assert len(processor.prepared) == 1
+    np.testing.assert_array_equal(processor.prepared[0][0], waveform)
+    assert processor.prepared[0][1:] == (2, 0.123)
+    np.testing.assert_allclose(received[0][0], [0.375, 0.5])
+    np.testing.assert_allclose(
+        received[0][1][0],
+        np.array([0.375, 0.5]) * (10.0 ** (-6.0 / 20.0)),
+    )
+
+
+def test_worker_publishes_exact_feature_window_on_frame_timeline() -> None:
+    class WindowProcessor(StubProcessor):
+        def feature_window_bounds(
+            self,
+            waveform: np.ndarray,
+            trigger_sample: int,
+            energy_threshold: float = 0.015,
+        ) -> tuple[int, int, int] | None:
+            return 1, 2, 5
+
+    processor = WindowProcessor()
+    listener = worker_only_listener(processor)
+    listener.chunk_size = 4
+    callback_event = threading.Event()
+    windows: list[tuple[float, float, float]] = []
+
+    def publish_window(start: float, onset: float, end: float) -> None:
+        windows.append((start, onset, end))
+        callback_event.set()
+
+    worker = threading.Thread(
+        target=listener._worker_loop,
+        args=(lambda *_args: None, None, None, None, (), publish_window),
+    )
+    worker.start()
+    waveform = np.arange(8, dtype=np.float32)
+    listener._capture_queue.put(
+        CapturedAudio(waveform, trigger_sample=2, trigger_frame=10)
+    )
+    assert callback_event.wait(timeout=2.0)
+    listener.stop()
+    worker.join(timeout=2.0)
+
+    assert windows == [(9.75, 10.0, 10.75)]
+
+
+def test_worker_skips_augmented_extraction_in_execute_mode() -> None:
+    processor = StubProcessor()
+    listener = worker_only_listener(processor)
+    callback_event = threading.Event()
+    received: list[np.ndarray] = []
+
+    def callback(features: np.ndarray, _tap_count: int) -> None:
+        received.append(features)
+        callback_event.set()
+
+    worker = threading.Thread(
+        target=listener._worker_loop,
+        args=(callback, None, lambda *_args: None, lambda: False, (-9.0, 6.0)),
+    )
+    worker.start()
+    listener._capture_queue.put(CapturedAudio(np.ones(4, dtype=np.float32), 0))
+    assert callback_event.wait(timeout=2.0)
+    listener.stop()
+    worker.join(timeout=2.0)
+
+    assert len(received) == 1
 
 
 def test_worker_surfaces_processing_failure() -> None:
@@ -122,3 +300,4 @@ def test_listener_reports_live_frames_and_capture_state() -> None:
     assert updates == [(updates[0][0], True), (0.0, False)]
     capture = listener._capture_queue.get_nowait()
     assert capture.trigger_sample == 0
+    assert capture.trigger_frame == 1

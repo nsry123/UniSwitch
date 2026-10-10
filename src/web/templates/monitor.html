@@ -36,13 +36,56 @@
         </article>
       </section>
 
+      <section class="panel result-panel" id="result-panel" aria-live="polite">
+        <div class="result-copy">
+          <div class="result-heading">
+            <p class="eyebrow">Latest knock</p>
+            <span class="result-badge waiting" id="result-status">Waiting</span>
+          </div>
+          <h2 id="result-label">No result yet</h2>
+          <p class="result-reason" id="result-reason">
+            Classification details will appear after the next captured knock.
+          </p>
+        </div>
+        <dl class="result-details" aria-label="Latest classification measurements">
+          <div><dt>Candidate</dt><dd id="result-candidate">—</dd></div>
+          <div><dt>Confidence</dt><dd id="result-confidence">—</dd></div>
+          <div><dt>Score / radius</dt><dd id="result-distance">—</dd></div>
+          <div><dt>Margin</dt><dd id="result-margin">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="panel calibration-panel needs_data" id="calibration-panel" aria-live="polite">
+        <div class="calibration-copy">
+          <div class="result-heading">
+            <p class="eyebrow">Interactive calibration</p>
+            <span class="result-badge waiting" id="calibration-state">Needs data</span>
+          </div>
+          <h2 id="calibration-title">Classifier setup</h2>
+          <p class="result-reason" id="calibration-message">
+            Register class captures to begin calibration.
+          </p>
+          <p class="calibration-progress" id="calibration-progress"></p>
+        </div>
+        <dl class="result-details" aria-label="Calibration status and measurements">
+          <div><dt>Class captures</dt><dd id="calibration-classes">—</dd></div>
+          <div><dt>Unknown captures</dt><dd id="calibration-unknowns">0 / 10</dd></div>
+          <div><dt>Known accuracy</dt><dd id="calibration-known">—</dd></div>
+          <div><dt>Unknown rejection</dt><dd id="calibration-rejection">—</dd></div>
+          <div class="calibration-parameters"><dt>Selected parameters</dt><dd id="calibration-parameters">—</dd></div>
+        </dl>
+      </section>
+
       <section class="panel energy-panel">
         <div class="panel-heading">
           <div>
             <p class="eyebrow">Detection signal</p>
             <h2>Energy over time</h2>
           </div>
-          <div class="legend"><span></span> Threshold <b id="threshold-legend">0.0150</b></div>
+          <div class="chart-legends">
+            <div class="legend"><span></span> Threshold <b id="threshold-legend">0.0150</b></div>
+            <div class="legend feature-legend"><span></span> BEATs feature window</div>
+          </div>
         </div>
         <div class="chart-wrap">
           <canvas id="energy-chart" aria-label="Live RMS energy with trigger threshold"></canvas>
@@ -62,7 +105,7 @@
         </div>
       </section>
 
-      <p class="hint">A knock starts capture when the green energy trace crosses the amber threshold.</p>
+      <p class="hint">The blue band marks the 580 ms BEATs window: 200 ms before the dashed onset marker and 380 ms after it.</p>
     </main>
     <script src="/monitor.js"></script>
   </body>

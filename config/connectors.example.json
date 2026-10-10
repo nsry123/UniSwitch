@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "connectors": [
+    {
+      "id": "home",
+      "type": "home_assistant",
+      "base_url": "http://homeassistant.local:8123",
+      "token_env": "HOME_ASSISTANT_TOKEN",
+      "event_type": "universal_switch_event",
+      "timeout_seconds": 5
+    }
+  ]
+}
