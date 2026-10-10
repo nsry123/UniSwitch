@@ -5,6 +5,7 @@ import pytest
 
 from main import (
     DEFAULT_DISTANCE_THRESHOLDS,
+    load_connector_dispatcher,
     load_or_create_classifier,
     parse_args,
     resolve_checkpoint_path,
@@ -24,8 +25,21 @@ def test_beats_is_cli_default(monkeypatch) -> None:
     assert arguments.model == "beats"
     assert arguments.checkpoint is None
     assert arguments.state_path is None
+    assert arguments.connector_config is None
+    assert arguments.no_connectors is False
     assert DEFAULT_DISTANCE_THRESHOLDS["beats"] == 0.15
     assert resolve_gain_db(arguments) == ()
+
+
+def test_missing_default_connector_config_disables_connectors(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["main.py"])
+
+    dispatcher = load_connector_dispatcher(parse_args())
+
+    assert dispatcher.connector_ids == ()
+    dispatcher.start()
+    dispatcher.close()
 
 
 def test_gain_cli_accepts_custom_values_and_disable(monkeypatch) -> None:

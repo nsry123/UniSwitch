@@ -6,8 +6,9 @@ threshold-qualified knocks within each captured window. By default, a frozen
 Microsoft BEATs Iter3+ AS2M encoder creates 768-D audio embeddings and the local
 prototype/exemplar classifier learns the user's labels. No cloud service is involved.
 
-The switch/action bridge is not implemented. A successful classification
-currently prints an action message to the terminal.
+Successful classifications can be published to smart-home platforms through an
+optional connector layer. Home Assistant is currently supported; without a
+connector configuration, the application retains its terminal-only behavior.
 
 ## Setup
 
@@ -116,6 +117,96 @@ evidence. Optional multi-capture confirmation is available through
 available through `--prototype-weight`, `--spread-multiplier`,
 `--margin-threshold`, and `--probability-temperature`. Persisted state files keep
 their scoring configuration.
+
+## Home Assistant connector
+
+Universal Switch can publish each confirmed action to the Home Assistant event
+bus. Home Assistant remains responsible for mapping a label and tap count to a
+light, switch, scene, script, notification, or other automation action. Audio,
+embeddings, and rejected captures never leave this application.
+
+In Home Assistant, create a long-lived access token from your user profile. Keep
+the token out of configuration files and provide it through the environment:
+
+```bash
+export HOME_ASSISTANT_TOKEN='your-long-lived-access-token'
+```
+
+Copy the tracked example and set the URL for your Home Assistant instance:
+
+```bash
+mkdir -p config
+cp config/connectors.example.json config/connectors.json
+```
+
+`config/connectors.json` is ignored by Git. It uses a versioned, multi-connector
+format even though Home Assistant is the only connector currently implemented:
+
+```json
+{
+  "version": 1,
+  "connectors": [
+    {
+      "id": "home",
+      "type": "home_assistant",
+      "base_url": "http://homeassistant.local:8123",
+      "token_env": "HOME_ASSISTANT_TOKEN",
+      "event_type": "universal_switch_event",
+      "timeout_seconds": 5
+    }
+  ]
+}
+```
+
+The default file is loaded automatically when present. Use
+`--connector-config /path/to/connectors.json` to select another file, or
+`--no-connectors` to disable delivery explicitly. At startup, the CLI checks the
+Home Assistant API. Rejected credentials stop startup with a safe error;
+temporary network or server failures produce a warning and capture continues.
+
+Each confirmed event is posted asynchronously as:
+
+```json
+{
+  "event_id": "8f73c808-c52a-486a-a21d-31d8030130ec",
+  "source": "universal_switch",
+  "occurred_at": "2026-08-31T16:10:00Z",
+  "label": "desk",
+  "tap_count": 2,
+  "confidence": 0.94
+}
+```
+
+For example, this Home Assistant automation toggles a light for a two-tap
+`desk` event:
+
+```yaml
+automation:
+  - alias: Universal Switch desk double tap
+    triggers:
+      - trigger: event
+        event_type: universal_switch_event
+    conditions:
+      - condition: template
+        value_template: >-
+          {{ trigger.event.data.label == 'desk'
+             and trigger.event.data.tap_count == 2 }}
+    actions:
+      - action: light.toggle
+        target:
+          entity_id: light.office
+```
+
+Delivery never blocks microphone processing. Events are sent once, in order,
+with no automatic retry because repeating an automation may be unsafe. Type
+`status` to inspect connector health, queue depth, and the latest delivery
+result. If events fail, verify the Home Assistant URL, token environment
+variable, API accessibility, and automation event type.
+
+New platforms implement the `ActionConnector` interface under `src/connectors`
+and are registered by the versioned configuration loader. Each connector gets
+an isolated worker queue, so adding Alexa, Google Home, MQTT, webhooks, or local
+Shortcuts does not change classification or controller code.
 
 ### Interactive calibration
 

@@ -25,7 +25,14 @@ from src.audio.processor import (
     SignalProcessor,
     beats_input_normalization_metadata,
 )
-from src.controller import SwitchController
+from src.connectors import (
+    DEFAULT_CONNECTOR_CONFIG_PATH,
+    ActionEvent,
+    ConnectorDispatcher,
+    DeliveryResult,
+    load_connectors,
+)
+from src.controller import EventDecision, EventStatus, SwitchController
 from src.ml.classifier import DistanceMode, TapClassifier
 from src.web.app import MicrophoneMonitor
 
@@ -39,6 +46,55 @@ DEFAULT_CHECKPOINT_PATHS = {
     "pann": PANN_CHECKPOINT_PATH,
 }
 DEFAULT_DISTANCE_THRESHOLDS = {"beats": 0.15, "pann": 0.20, "legacy": 2.5}
+
+
+def action_event_from_decision(decision: EventDecision) -> ActionEvent | None:
+    """Convert only a confirmed controller event into a connector event."""
+    if decision.status is not EventStatus.EVENT or decision.label is None:
+        return None
+    classification = decision.classification
+    probabilities = () if classification is None else classification.probabilities.values()
+    confidence = max(probabilities, default=None)
+    return ActionEvent.create(decision.label, decision.tap_count, confidence)
+
+
+def dispatch_decision(decision: EventDecision, dispatcher: ConnectorDispatcher) -> bool:
+    """Submit an accepted event when at least one connector is configured."""
+    if not dispatcher.connector_ids:
+        return False
+    event = action_event_from_decision(decision)
+    return False if event is None else dispatcher.submit(event)
+
+
+def report_connector_result(result: DeliveryResult) -> None:
+    """Print an asynchronous delivery outcome without exposing credentials."""
+    marker = "+" if result.success else "!"
+    print(f"\n[{marker}] Connector {result.connector_id!r}: {result.message}")
+
+
+def load_connector_dispatcher(arguments: argparse.Namespace) -> ConnectorDispatcher:
+    """Load and health-check optional connectors without starting their workers."""
+    requested_path = arguments.connector_config
+    if arguments.no_connectors:
+        connectors = []
+    else:
+        config_path = (
+            DEFAULT_CONNECTOR_CONFIG_PATH if requested_path is None else requested_path
+        )
+        connectors = load_connectors(
+            config_path,
+            missing_ok=requested_path is None,
+        )
+    dispatcher = ConnectorDispatcher(connectors, result_callback=report_connector_result)
+    if not connectors:
+        print("[*] Smart-home connectors: disabled")
+        return dispatcher
+    health = dispatcher.check_health()
+    print(f"[*] Smart-home connectors: {', '.join(dispatcher.connector_ids)}")
+    for connector_id, result in zip(dispatcher.connector_ids, health, strict=True):
+        marker = "+" if result.available else "!"
+        print(f"[{marker}] Connector {connector_id!r}: {result.message}")
+    return dispatcher
 
 
 def gain_db_argument(value: str) -> float:
@@ -165,6 +221,7 @@ def load_or_create_classifier(
 def run_application(arguments: argparse.Namespace) -> int:
     """Start capture and serve the interactive command loop."""
     gain_db_values = resolve_gain_db(arguments)
+    dispatcher = load_connector_dispatcher(arguments)
     checkpoint_path = resolve_checkpoint_path(arguments.model, arguments.checkpoint)
     processor = SignalProcessor(
         model=arguments.model,
@@ -256,12 +313,14 @@ def run_application(arguments: argparse.Namespace) -> int:
         threshold=arguments.energy_threshold,
         frame_callback=None if monitor is None else monitor.publish,
     )
+    dispatcher.start()
 
     def report_worker_error(error: Exception) -> None:
         print(f"\n[!] Audio processing stopped: {type(error).__name__}: {error}")
 
     def process_capture(features: np.ndarray, tap_count: int) -> None:
         decision = controller.process_capture(features, tap_count)
+        dispatch_decision(decision, dispatcher)
         if monitor is not None:
             monitor.publish_decision(decision)
             monitor.publish_calibration(controller.calibration_snapshot())
@@ -272,6 +331,7 @@ def run_application(arguments: argparse.Namespace) -> int:
         augmented_features: tuple[np.ndarray, ...],
     ) -> None:
         decision = controller.process_capture(features, tap_count, augmented_features)
+        dispatch_decision(decision, dispatcher)
         if monitor is not None:
             monitor.publish_decision(decision)
             monitor.publish_calibration(controller.calibration_snapshot())
@@ -325,6 +385,19 @@ def run_application(arguments: argparse.Namespace) -> int:
                     f"listener_alive={audio_thread.is_alive()}"
                 )
                 print(f"[*] {calibration['message']}")
+                connector_status = dispatcher.snapshot()
+                if not connector_status:
+                    print("[*] connectors=disabled")
+                for state in connector_status:
+                    delivery = state["last_delivery"]
+                    delivery_text = "none"
+                    if delivery is not None:
+                        outcome = "ok" if delivery["success"] else "failed"
+                        delivery_text = f"{outcome}: {delivery['message']}"
+                    print(
+                        f"[*] connector={state['id']} available={state['available']} "
+                        f"queued={state['queue_depth']} last_delivery={delivery_text}"
+                    )
             elif command == "list":
                 exemplar_counts = controller.classifier.class_counts()
                 capture_counts = controller.classifier.class_capture_counts()
@@ -382,6 +455,7 @@ def run_application(arguments: argparse.Namespace) -> int:
     finally:
         listener.stop()
         audio_thread.join(timeout=3.0)
+        dispatcher.close(drain_timeout=3.0)
         if monitor is not None:
             monitor.stop()
 
@@ -422,6 +496,15 @@ def parse_args() -> argparse.Namespace:
     gain_group.add_argument("--no-gain-augmentation", action="store_true")
     parser.add_argument("--monitor-port", type=int, default=8765)
     parser.add_argument("--no-monitor", action="store_true")
+    connector_group = parser.add_mutually_exclusive_group()
+    connector_group.add_argument(
+        "--connector-config",
+        type=Path,
+        help=(
+            "connector JSON path; defaults to config/connectors.json when that file exists"
+        ),
+    )
+    connector_group.add_argument("--no-connectors", action="store_true")
     return parser.parse_args()
 
 
