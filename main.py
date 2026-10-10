@@ -33,7 +33,7 @@ from src.connectors import (
     load_connectors,
 )
 from src.controller import EventDecision, EventStatus, SwitchController
-from src.ml.classifier import DistanceMode, TapClassifier
+from src.ml.classifier import DistanceMode, TapClassifier, ThresholdMode
 from src.web.app import MicrophoneMonitor
 
 DEFAULT_STATE_PATHS = {
@@ -160,6 +160,7 @@ def load_or_create_classifier(
     spread_multiplier: float,
     margin_threshold: float | None,
     probability_temperature: float | None,
+    threshold_mode: ThresholdMode = "fixed",
 ) -> TapClassifier:
     """Load compatible registrations or return a new classifier."""
     if state_path is None or not state_path.exists():
@@ -171,6 +172,7 @@ def load_or_create_classifier(
             spread_multiplier=spread_multiplier,
             margin_threshold=margin_threshold,
             probability_temperature=probability_temperature,
+            threshold_mode=threshold_mode,
         )
 
     classifier = TapClassifier.load(state_path)
@@ -230,8 +232,9 @@ def classifier_status_lines(classifier: TapClassifier) -> list[str]:
         calibration = classifier.threshold_calibrations.get(label)
         source = "fallback" if calibration is None else calibration.source
         lines.append(
-            f"    {label}: threshold={classifier.threshold_for_label(label):.4f} "
-            f"samples={classifier.y_labels.count(label)} calibration={source}"
+            f"    {label}: distance={classifier.threshold_for_label(label):.4f} ({source}) "
+            f"margin={classifier.margin_threshold:.4f} "
+            f"samples={classifier.class_capture_counts()[label]}"
         )
     return lines
 
@@ -256,9 +259,9 @@ def run_application(arguments: argparse.Namespace) -> int:
     distance_mode: DistanceMode = (
         "cosine" if arguments.model in {"beats", "pann"} else "standardized_euclidean"
     )
-    threshold_mode: ThresholdMode = arguments.threshold_mode
-    if threshold_mode is None:
-        threshold_mode = "auto" if arguments.model == "pann" else "fixed"
+    threshold_mode: ThresholdMode = arguments.threshold_mode or (
+        "auto" if arguments.model == "pann" else "fixed"
+    )
     threshold = arguments.distance_threshold
     if threshold is None:
         threshold = DEFAULT_DISTANCE_THRESHOLDS[arguments.model]
@@ -297,6 +300,7 @@ def run_application(arguments: argparse.Namespace) -> int:
         spread_multiplier=arguments.spread_multiplier,
         margin_threshold=arguments.margin_threshold,
         probability_temperature=arguments.probability_temperature,
+        threshold_mode=threshold_mode,
     )
     print(
         f"[*] Classifier distance: {classifier.distance_mode} "
@@ -407,6 +411,8 @@ def run_application(arguments: argparse.Namespace) -> int:
                     f"listener_alive={audio_thread.is_alive()}"
                 )
                 print(f"[*] {calibration['message']}")
+                for line in classifier_status_lines(controller.classifier):
+                    print(line)
                 connector_status = dispatcher.snapshot()
                 if not connector_status:
                     print("[*] connectors=disabled")
@@ -497,6 +503,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-state", action="store_true")
     parser.add_argument("--neighbors", type=int, default=3)
     parser.add_argument("--distance-threshold", type=float)
+    parser.add_argument(
+        "--threshold-mode",
+        choices=("auto", "fixed"),
+        help="exemplar rejection thresholds: auto for PANN, fixed for BEATs/legacy by default",
+    )
     parser.add_argument("--prototype-weight", type=float, default=0.5)
     parser.add_argument("--spread-multiplier", type=float, default=2.0)
     parser.add_argument("--margin-threshold", type=float)

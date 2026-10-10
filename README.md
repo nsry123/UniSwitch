@@ -111,6 +111,16 @@ registered exemplars, and leave-one-out spread. A prediction must pass both its
 class-specific distance radius and the margin from the runner-up class. Known
 class probabilities are derived from the blended centroid/exemplar scores.
 
+PANN also uses automatic per-label exemplar thresholds by default. These require
+five independent original captures; gain augmentations do not count toward that
+minimum. Use `--threshold-mode fixed` to keep the global exemplar threshold, or
+`--threshold-mode auto` to enable automatic thresholds with cosine features.
+Automatic thresholds supplement the prototype radius and runner-up margin;
+they do not replace either rejection check. The `status` command shows each
+label's exemplar threshold, calibration source, and required margin. Threshold
+settings are saved with registrations, and interactive calibration preserves
+the selected mode.
+
 An accepted capture triggers its action immediately. After an event, matching
 captures are suppressed for two seconds. Rejected captures clear pending
 evidence. Optional multi-capture confirmation is available through
