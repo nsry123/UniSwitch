@@ -112,6 +112,7 @@ def test_cosine_calibration_matches_runtime_distance_mode() -> None:
     report = evaluate_classifier(classifier, validation_x, validation_y)
 
     assert classifier.distance_mode == "cosine"
+    assert calibration.distance_thresholds == classifier.distance_thresholds
     assert calibration.known_end_to_end_accuracy == 1.0
     assert calibration.unknown_rejection_rate == 1.0
     assert report.known_end_to_end_accuracy == 1.0

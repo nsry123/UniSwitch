@@ -214,8 +214,26 @@ def load_or_create_classifier(
             f"state file uses distance mode {classifier.distance_mode!r}, "
             f"not {distance_mode!r}; use a compatible state file"
         )
+    if classifier.threshold_mode != threshold_mode:
+        raise ValueError(
+            f"state file uses threshold mode {classifier.threshold_mode!r}, "
+            f"not {threshold_mode!r}; use a compatible state file"
+        )
     print(f"[*] Loaded {len(classifier.X_data)} registration(s) from {state_path}")
     return classifier
+
+
+def classifier_status_lines(classifier: TapClassifier) -> list[str]:
+    """Format per-label rejection calibration for the interactive status command."""
+    lines: list[str] = []
+    for label in sorted(set(classifier.y_labels)):
+        calibration = classifier.threshold_calibrations.get(label)
+        source = "fallback" if calibration is None else calibration.source
+        lines.append(
+            f"    {label}: threshold={classifier.threshold_for_label(label):.4f} "
+            f"samples={classifier.y_labels.count(label)} calibration={source}"
+        )
+    return lines
 
 
 def run_application(arguments: argparse.Namespace) -> int:
@@ -238,6 +256,9 @@ def run_application(arguments: argparse.Namespace) -> int:
     distance_mode: DistanceMode = (
         "cosine" if arguments.model in {"beats", "pann"} else "standardized_euclidean"
     )
+    threshold_mode: ThresholdMode = arguments.threshold_mode
+    if threshold_mode is None:
+        threshold_mode = "auto" if arguments.model == "pann" else "fixed"
     threshold = arguments.distance_threshold
     if threshold is None:
         threshold = DEFAULT_DISTANCE_THRESHOLDS[arguments.model]
@@ -279,7 +300,8 @@ def run_application(arguments: argparse.Namespace) -> int:
     )
     print(
         f"[*] Classifier distance: {classifier.distance_mode} "
-        f"(rejection threshold: {classifier.distance_threshold:g})"
+        f"(threshold mode: {classifier.threshold_mode}, "
+        f"fallback/cap: {classifier.distance_threshold:g})"
     )
     print(
         f"[*] Prototype scoring: weight={classifier.prototype_weight:g} "

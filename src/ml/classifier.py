@@ -16,6 +16,8 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 
 DistanceMode = Literal["cosine", "standardized_euclidean"]
+ThresholdMode = Literal["auto", "fixed"]
+CalibrationSource = Literal["fallback", "registration", "validation"]
 DISTANCE_MODES = frozenset({"cosine", "standardized_euclidean"})
 MIN_CLASS_CAPTURES = 3
 # Backward-compatible import name. Eligibility is now based on physical captures.
@@ -28,6 +30,14 @@ def validate_distance_mode(distance_mode: str) -> DistanceMode:
         choices = ", ".join(sorted(DISTANCE_MODES))
         raise ValueError(f"distance_mode must be one of: {choices}")
     return cast(DistanceMode, distance_mode)
+
+
+def validate_threshold_mode(threshold_mode: str) -> ThresholdMode:
+    """Return a supported threshold mode or raise a configuration error."""
+    if threshold_mode not in THRESHOLD_MODES:
+        choices = ", ".join(sorted(THRESHOLD_MODES))
+        raise ValueError(f"threshold_mode must be one of: {choices}")
+    return cast(ThresholdMode, threshold_mode)
 
 
 def normalize_feature_matrix(features: np.ndarray, name: str) -> np.ndarray:
@@ -130,6 +140,8 @@ class TapClassifier:
         self.calibration_report: dict[str, Any] | None = None
         self.is_trained = False
         self.feature_dim: int | None = None
+        self.distance_thresholds: dict[str, float] = {}
+        self.threshold_calibrations: dict[str, ThresholdCalibration] = {}
         self.metadata: dict[str, Any] = {}
         self._class_statistics: dict[str, _ClassStatistics] = {}
         self._transformed_features: np.ndarray | None = None
@@ -596,4 +608,53 @@ class TapClassifier:
         classifier.calibration_report = dict(report) if isinstance(report, dict) else None
         classifier.metadata = metadata
         classifier._fit_if_ready()
+        registered_labels = sorted(set(classifier.y_labels))
+        if schema_version < cls.SCHEMA_VERSION:
+            for label in registered_labels:
+                classifier._calibrate_label_from_registrations(label)
+        else:
+            persisted_thresholds = manifest.get("distance_thresholds")
+            persisted_calibrations = manifest.get("threshold_calibrations")
+            if not isinstance(persisted_thresholds, dict) or not isinstance(
+                persisted_calibrations, dict
+            ):
+                raise ValueError("classifier state has invalid threshold calibration data")
+            for label in registered_labels:
+                threshold = float(persisted_thresholds.get(label, classifier.distance_threshold))
+                raw_calibration = persisted_calibrations.get(label)
+                if not isinstance(raw_calibration, dict):
+                    raise ValueError(f"classifier state is missing calibration for {label!r}")
+                calibration_source = str(raw_calibration.get("source"))
+                if calibration_source not in {"fallback", "registration", "validation"}:
+                    raise ValueError(
+                        "classifier state has invalid calibration source: "
+                        f"{calibration_source}"
+                    )
+                calibration = ThresholdCalibration(
+                    threshold=float(raw_calibration["threshold"]),
+                    sample_count=int(raw_calibration["sample_count"]),
+                    median_distance=(
+                        None
+                        if raw_calibration.get("median_distance") is None
+                        else float(raw_calibration["median_distance"])
+                    ),
+                    max_distance=(
+                        None
+                        if raw_calibration.get("max_distance") is None
+                        else float(raw_calibration["max_distance"])
+                    ),
+                    source=cast(CalibrationSource, calibration_source),
+                )
+                if not np.isfinite(threshold) or threshold < 0:
+                    raise ValueError(f"classifier state has invalid threshold for {label!r}")
+                if classifier.threshold_mode == "auto" and not (
+                    MIN_COSINE_THRESHOLD <= threshold <= classifier.distance_threshold
+                ):
+                    raise ValueError(
+                        f"classifier state threshold is outside the auto cap for {label!r}"
+                    )
+                if not np.isclose(threshold, calibration.threshold):
+                    raise ValueError(f"classifier state threshold mismatch for {label!r}")
+                classifier.distance_thresholds[label] = threshold
+                classifier.threshold_calibrations[label] = calibration
         return classifier
