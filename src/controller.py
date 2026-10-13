@@ -244,6 +244,7 @@ class SwitchController:
             negative_ids = list(source.negative_capture_ids)
             next_capture_id = source.next_capture_id
             distance_mode = source.distance_mode
+            threshold_mode = source.threshold_mode
             metadata = dict(source.metadata)
             self._calibration.update(
                 {
@@ -273,6 +274,7 @@ class SwitchController:
                 augmented,
                 negatives,
                 distance_mode=distance_mode,
+                threshold_mode=threshold_mode,
                 progress_callback=publish_progress,
             )
         except Exception as error:

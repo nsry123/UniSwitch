@@ -14,6 +14,7 @@ from src.ml.classifier import (
     DistanceMode,
     TapClassifier,
     ThresholdMode,
+    normalize_feature_matrix,
     validate_distance_mode,
     validate_threshold_mode,
 )
@@ -265,6 +266,7 @@ def _build_grouped_classifier(
     spread_multiplier: float,
     margin_threshold: float,
     probability_temperature: float,
+    threshold_mode: ThresholdMode = "fixed",
 ) -> TapClassifier:
     """Build one candidate without repeatedly fitting after every exemplar."""
     classifier = TapClassifier(
@@ -275,6 +277,7 @@ def _build_grouped_classifier(
         spread_multiplier=spread_multiplier,
         margin_threshold=margin_threshold,
         probability_temperature=probability_temperature,
+        threshold_mode=threshold_mode,
     )
     classifier.feature_dim = features.shape[1]
     classifier.X_data = [row.copy() for row in features]
@@ -283,6 +286,8 @@ def _build_grouped_classifier(
     classifier.augmented_flags = [bool(value) for value in augmented]
     classifier.next_capture_id = int(np.max(capture_ids)) + 1
     classifier._fit_if_ready()
+    for label in sorted(set(classifier.y_labels)):
+        classifier._calibrate_label_from_registrations(label)
     return classifier
 
 
@@ -361,6 +366,7 @@ def calibrate_grouped_classifier(
     margin_ratio_candidates: Iterable[float] = (0.0, 0.05, 0.1, 0.2),
     temperature_ratio_candidates: Iterable[float] = (0.25, 0.5, 1.0),
     progress_callback: Callable[[int, int], None] | None = None,
+    threshold_mode: ThresholdMode = "fixed",
 ) -> tuple[TapClassifier, GroupedCalibrationResult]:
     """Calibrate with capture-grouped folds and explicit unknown examples."""
     x = _as_feature_matrix(features, "features")
@@ -375,6 +381,9 @@ def calibrate_grouped_classifier(
     if len(negatives) < 10:
         raise ValueError("interactive calibration needs at least ten unknown captures")
     selected_mode = validate_distance_mode(distance_mode)
+    selected_threshold_mode = validate_threshold_mode(threshold_mode)
+    if selected_threshold_mode == "auto" and selected_mode != "cosine":
+        raise ValueError("automatic thresholds require cosine distance")
     fold_assignments, fold_count = _grouped_folds(y, groups, augmented_mask)
     thresholds = _distance_threshold_candidates(
         x,
@@ -386,6 +395,8 @@ def calibrate_grouped_classifier(
         fold_count,
         selected_mode,
     )
+    if selected_threshold_mode == "auto":
+        thresholds = np.unique(np.maximum(thresholds, MIN_COSINE_THRESHOLD))
     neighbors = sorted({int(value) for value in neighbor_candidates if int(value) > 0})
     weights = sorted({float(value) for value in prototype_weight_candidates})
     spreads = sorted({float(value) for value in spread_multiplier_candidates})
@@ -426,6 +437,7 @@ def calibrate_grouped_classifier(
                                 spread_multiplier=spread,
                                 margin_threshold=margin_ratio * threshold,
                                 probability_temperature=0.5 * threshold,
+                                threshold_mode=selected_threshold_mode,
                             )
                             for vector, truth in zip(
                                 x[validation_mask], y[validation_mask], strict=True
@@ -487,6 +499,7 @@ def calibrate_grouped_classifier(
                 spread_multiplier=spread,
                 margin_threshold=margin_threshold,
                 probability_temperature=temperature_ratio * threshold,
+                threshold_mode=selected_threshold_mode,
             )
             for vector, truth in zip(x[validation_mask], y[validation_mask], strict=True):
                 decision = classifier.predict_detailed(vector)
@@ -511,6 +524,7 @@ def calibrate_grouped_classifier(
         spread_multiplier=spread,
         margin_threshold=margin_threshold,
         probability_temperature=best_temperature,
+        threshold_mode=selected_threshold_mode,
     )
     result = GroupedCalibrationResult(
         n_neighbors=neighbor_count,
@@ -527,142 +541,6 @@ def calibrate_grouped_classifier(
         evaluated_candidates=evaluated,
     )
     return final_classifier, result
-
-
-def _calibrate_per_label_thresholds(
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    x_validation: np.ndarray,
-    y_validation: np.ndarray,
-    candidates: list[int],
-    known_mask: np.ndarray,
-    unknown_mask: np.ndarray,
-    distance_mode: DistanceMode,
-    cap: float,
-) -> tuple[TapClassifier, CalibrationResult]:
-    best: CalibrationResult | None = None
-    best_classifier: TapClassifier | None = None
-    labels = sorted(set(y_train.tolist()))
-
-    for n_neighbors in candidates:
-        classifier = TapClassifier(
-            n_neighbors=n_neighbors,
-            distance_threshold=cap,
-            distance_mode=distance_mode,
-            threshold_mode="auto",
-        )
-        for vector, label in zip(x_train, y_train, strict=True):
-            classifier.register_tap(vector, str(label))
-
-        predicted_and_distances = [
-            classifier.classify_without_rejection(vector) for vector in x_validation
-        ]
-        predicted = np.asarray(
-            [prediction for prediction, _distance in predicted_and_distances],
-            dtype=np.str_,
-        )
-        nearest = np.asarray(
-            [distance for _prediction, distance in predicted_and_distances],
-            dtype=np.float64,
-        )
-
-        for label in labels:
-            positive_mask = (predicted == label) & (y_validation == label)
-            impostor_mask = (predicted == label) & (y_validation != label)
-            if not positive_mask.any() or not impostor_mask.any():
-                continue
-            local_distances = nearest[predicted == label]
-            thresholds = np.unique(
-                np.clip(
-                    np.concatenate(
-                        (
-                            [MIN_COSINE_THRESHOLD],
-                            local_distances,
-                            [cap],
-                        )
-                    ),
-                    MIN_COSINE_THRESHOLD,
-                    cap,
-                )
-            )
-            best_threshold = MIN_COSINE_THRESHOLD
-            best_local_objective = -np.inf
-            for threshold in thresholds:
-                positive_acceptance = float(np.mean(nearest[positive_mask] <= threshold))
-                impostor_rejection = float(np.mean(nearest[impostor_mask] > threshold))
-                local_objective = (positive_acceptance + impostor_rejection) / 2.0
-                if (local_objective, -float(threshold)) > (
-                    best_local_objective,
-                    -best_threshold,
-                ):
-                    best_local_objective = local_objective
-                    best_threshold = float(threshold)
-            classifier.set_validation_calibration(
-                str(label),
-                best_threshold,
-                nearest[positive_mask],
-            )
-
-        accepted = np.asarray(
-            [
-                distance <= classifier.threshold_for_label(str(label))
-                for label, distance in zip(predicted, nearest, strict=True)
-            ]
-        )
-        known_accuracy, unknown_rejection, objective = _calibration_scores(
-            predicted,
-            y_validation,
-            accepted,
-            known_mask,
-            unknown_mask,
-        )
-        result = CalibrationResult(
-            n_neighbors=n_neighbors,
-            distance_threshold=cap,
-            distance_thresholds=dict(classifier.distance_thresholds),
-            objective=objective,
-            known_end_to_end_accuracy=known_accuracy,
-            unknown_rejection_rate=unknown_rejection,
-        )
-        result_tie_break = -sum(result.distance_thresholds.values())
-        best_tie_break = (
-            -sum(best.distance_thresholds.values()) if best is not None else -np.inf
-        )
-        if best is None or (
-            result.objective,
-            result_tie_break,
-            -result.n_neighbors,
-        ) > (
-            best.objective,
-            best_tie_break,
-            -best.n_neighbors,
-        ):
-            best = result
-            best_classifier = classifier
-
-    assert best is not None and best_classifier is not None
-    return best_classifier, best
-
-
-def _calibration_scores(
-    predicted: np.ndarray,
-    actual: np.ndarray,
-    accepted: np.ndarray,
-    known_mask: np.ndarray,
-    unknown_mask: np.ndarray,
-) -> tuple[float, float | None, float]:
-    known_accuracy = float(
-        np.mean((predicted == actual)[known_mask] & accepted[known_mask])
-    )
-    unknown_rejection = (
-        float(np.mean(~accepted[unknown_mask])) if unknown_mask.any() else None
-    )
-    objective = (
-        known_accuracy
-        if unknown_rejection is None
-        else (known_accuracy + unknown_rejection) / 2.0
-    )
-    return known_accuracy, unknown_rejection, objective
 
 
 def evaluate_classifier(

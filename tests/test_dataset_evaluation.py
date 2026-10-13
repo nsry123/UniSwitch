@@ -112,7 +112,10 @@ def test_cosine_calibration_matches_runtime_distance_mode() -> None:
     report = evaluate_classifier(classifier, validation_x, validation_y)
 
     assert classifier.distance_mode == "cosine"
-    assert calibration.distance_thresholds == classifier.distance_thresholds
+    assert all(
+        threshold == calibration.distance_threshold
+        for threshold in classifier.distance_thresholds.values()
+    )
     assert calibration.known_end_to_end_accuracy == 1.0
     assert calibration.unknown_rejection_rate == 1.0
     assert report.known_end_to_end_accuracy == 1.0
@@ -129,7 +132,8 @@ def test_calibration_requires_three_examples_per_class() -> None:
         )
 
 
-def test_grouped_calibration_uses_physical_captures_and_unknowns() -> None:
+@pytest.mark.parametrize("threshold_mode", ["fixed", "auto"])
+def test_grouped_calibration_uses_physical_captures_and_unknowns(threshold_mode) -> None:
     features = []
     labels = []
     capture_ids = []
@@ -152,6 +156,7 @@ def test_grouped_calibration_uses_physical_captures_and_unknowns() -> None:
         np.asarray(augmented),
         negatives,
         distance_mode="cosine",
+        threshold_mode=threshold_mode,
         neighbor_candidates=(1,),
         prototype_weight_candidates=(0.5,),
         spread_multiplier_candidates=(2.0,),
@@ -160,6 +165,7 @@ def test_grouped_calibration_uses_physical_captures_and_unknowns() -> None:
     )
 
     assert classifier.class_capture_counts() == {"desk": 4, "wall": 4}
+    assert classifier.threshold_mode == threshold_mode
     assert result.fold_count == 4
     assert result.known_end_to_end_accuracy >= 0.75
     assert result.unknown_rejection_rate == 1.0

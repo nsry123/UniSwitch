@@ -17,6 +17,6 @@ def test_classifier_status_reports_per_label_calibration() -> None:
     status = "\n".join(classifier_status_lines(classifier))
 
     assert "desk: distance=" in status
-    assert "separation=" in status
+    assert "margin=" in status
     assert "samples=5" in status
     assert "(registration)" in status

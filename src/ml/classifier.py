@@ -7,7 +7,7 @@ import os
 import tempfile
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, cast
@@ -19,6 +19,9 @@ DistanceMode = Literal["cosine", "standardized_euclidean"]
 ThresholdMode = Literal["auto", "fixed"]
 CalibrationSource = Literal["fallback", "registration", "validation"]
 DISTANCE_MODES = frozenset({"cosine", "standardized_euclidean"})
+THRESHOLD_MODES = frozenset({"auto", "fixed"})
+MIN_AUTO_CAPTURES = 5
+MIN_COSINE_THRESHOLD = 0.01
 MIN_CLASS_CAPTURES = 3
 # Backward-compatible import name. Eligibility is now based on physical captures.
 MIN_CLASS_SAMPLES = MIN_CLASS_CAPTURES
@@ -51,6 +54,17 @@ def normalize_feature_matrix(features: np.ndarray, name: str) -> np.ndarray:
     if np.any(norms == 0):
         raise ValueError(f"{name} contains a zero-norm feature vector")
     return matrix / norms
+
+
+@dataclass(frozen=True)
+class ThresholdCalibration:
+    """Describe the source of a label's exemplar rejection threshold."""
+
+    threshold: float
+    sample_count: int
+    median_distance: float | None
+    max_distance: float | None
+    source: CalibrationSource
 
 
 @dataclass(frozen=True)
@@ -101,6 +115,7 @@ class TapClassifier:
         spread_multiplier: float = 2.0,
         margin_threshold: float | None = None,
         probability_temperature: float | None = None,
+        threshold_mode: ThresholdMode = "fixed",
     ) -> None:
         if n_neighbors <= 0:
             raise ValueError("n_neighbors must be positive")
@@ -122,6 +137,14 @@ class TapClassifier:
         self.n_neighbors = int(n_neighbors)
         self.distance_threshold = float(distance_threshold)
         self.distance_mode = validate_distance_mode(distance_mode)
+        self.threshold_mode = validate_threshold_mode(threshold_mode)
+        if self.threshold_mode == "auto":
+            if self.distance_mode != "cosine":
+                raise ValueError("automatic thresholds require cosine distance")
+            if self.distance_threshold < MIN_COSINE_THRESHOLD:
+                raise ValueError(
+                    f"automatic cosine threshold cap must be at least {MIN_COSINE_THRESHOLD}"
+                )
         self.prototype_weight = float(prototype_weight)
         self.spread_multiplier = float(spread_multiplier)
         self.margin_threshold = float(margin_threshold)
@@ -282,6 +305,70 @@ class TapClassifier:
             self.next_capture_id += 1
             return capture_id
 
+    def threshold_for_label(self, label: str) -> float:
+        """Return a label's exemplar threshold or the configured fallback."""
+        with self._lock:
+            normalized_label = self._validate_label(label)
+            return self.distance_thresholds.get(normalized_label, self.distance_threshold)
+
+    def _calibrate_label_from_registrations(self, label: str) -> None:
+        # Augmentations and repeated rows from one capture are not independent samples.
+        originals: dict[int, np.ndarray] = {}
+        for vector, stored_label, capture_id, augmented in zip(
+            self.X_data, self.y_labels, self.capture_ids, self.augmented_flags, strict=True
+        ):
+            if stored_label == label and not augmented:
+                originals.setdefault(capture_id, vector)
+        count = len(originals)
+        calibration = ThresholdCalibration(self.distance_threshold, count, None, None, "fallback")
+        if self.threshold_mode == "auto" and count >= MIN_AUTO_CAPTURES:
+            features = normalize_feature_matrix(np.vstack(list(originals.values())), label)
+            pairwise = np.clip(1.0 - features @ features.T, 0.0, 2.0)
+            np.fill_diagonal(pairwise, np.inf)
+            distances = np.min(pairwise, axis=1)
+            threshold = float(
+                np.clip(
+                    np.percentile(distances, 90, method="higher") * 1.1,
+                    MIN_COSINE_THRESHOLD,
+                    self.distance_threshold,
+                )
+            )
+            calibration = ThresholdCalibration(
+                threshold,
+                count,
+                float(np.median(distances)),
+                float(np.max(distances)),
+                "registration",
+            )
+        self.distance_thresholds[label] = calibration.threshold
+        self.threshold_calibrations[label] = calibration
+
+    def set_validation_calibration(
+        self, label: str, threshold: float, distances: np.ndarray
+    ) -> None:
+        """Install an exemplar threshold measured on independent validation captures."""
+        with self._lock:
+            if self.threshold_mode != "auto":
+                raise ValueError("validation calibration requires automatic threshold mode")
+            normalized_label = self._validate_label(label)
+            if normalized_label not in self.y_labels:
+                raise ValueError(f"label has no registered examples: {normalized_label!r}")
+            if not np.isfinite(threshold) or not (
+                MIN_COSINE_THRESHOLD <= threshold <= self.distance_threshold
+            ):
+                raise ValueError("validation threshold must be within the configured cap")
+            values = np.asarray(distances, dtype=np.float64)
+            if values.ndim != 1 or not values.size or not np.isfinite(values).all():
+                raise ValueError("validation distances must be a finite non-empty vector")
+            self.distance_thresholds[normalized_label] = float(threshold)
+            self.threshold_calibrations[normalized_label] = ThresholdCalibration(
+                float(threshold),
+                int(values.size),
+                float(np.median(values)),
+                float(np.max(values)),
+                "validation",
+            )
+
     def register_tap(
         self,
         feature_vector: np.ndarray,
@@ -309,6 +396,7 @@ class TapClassifier:
             self.data_revision += 1
             self.calibration_report = None
             self._fit_if_ready()
+            self._calibrate_label_from_registrations(normalized_label)
             class_count = self.class_capture_counts()[normalized_label]
             if not announce:
                 return
@@ -367,6 +455,8 @@ class TapClassifier:
             self.calibration_report = None
             if not self.X_data:
                 self.feature_dim = None
+            self.distance_thresholds.pop(normalized_label, None)
+            self.threshold_calibrations.pop(normalized_label, None)
             self._fit_if_ready()
             return len(matching)
 
@@ -439,6 +529,11 @@ class TapClassifier:
             rejection_reason: str | None = None
             if best.score > best.acceptance_radius:
                 rejection_reason = "distance"
+            elif self.threshold_mode == "auto" and min(
+                self._distance(transformed, exemplar)
+                for exemplar in self._class_statistics[best.label].exemplars
+            ) > self.threshold_for_label(best.label):
+                rejection_reason = "distance"
             elif margin < self.margin_threshold:
                 rejection_reason = "margin"
             accepted = rejection_reason is None
@@ -485,6 +580,12 @@ class TapClassifier:
                 "n_neighbors": self.n_neighbors,
                 "distance_threshold": self.distance_threshold,
                 "distance_mode": self.distance_mode,
+                "threshold_mode": self.threshold_mode,
+                "distance_thresholds": self.distance_thresholds,
+                "threshold_calibrations": {
+                    label: asdict(calibration)
+                    for label, calibration in self.threshold_calibrations.items()
+                },
                 "prototype_weight": self.prototype_weight,
                 "spread_multiplier": self.spread_multiplier,
                 "margin_threshold": self.margin_threshold,
@@ -591,6 +692,7 @@ class TapClassifier:
             spread_multiplier=float(manifest.get("spread_multiplier", 2.0)),
             margin_threshold=float(manifest.get("margin_threshold", 0.1 * threshold)),
             probability_temperature=float(manifest.get("probability_temperature", 0.5 * threshold)),
+            threshold_mode=validate_threshold_mode(str(manifest.get("threshold_mode", "fixed"))),
         )
         classifier.feature_dim = features.shape[1]
         classifier.X_data = [row.copy() for row in features]
@@ -609,7 +711,7 @@ class TapClassifier:
         classifier.metadata = metadata
         classifier._fit_if_ready()
         registered_labels = sorted(set(classifier.y_labels))
-        if schema_version < cls.SCHEMA_VERSION:
+        if "threshold_calibrations" not in manifest:
             for label in registered_labels:
                 classifier._calibrate_label_from_registrations(label)
         else:
