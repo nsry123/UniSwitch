@@ -1,6 +1,7 @@
 # macOS
 .DS_Store
-
+CLAUDE.md
+AGENTS.md
 # Python
 __pycache__/
 .ipynb_checkpoints/
